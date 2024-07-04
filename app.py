@@ -1,11 +1,11 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
-import math
+import tempfile
 import subprocess
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adset import AdSet
@@ -14,7 +14,6 @@ from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
 
-# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
@@ -24,59 +23,12 @@ app_secret = "88d92443cfcfc3922cdea79b384a116e"
 access_token = "EAAEeNcueZAVYBO0NvEUMo378SikOh70zuWuWgimHhnE5Vk7ye8sZCaRtu9qQGWNDvlBZBBnZAT6HCuDlNc4OeOSsdSw5qmhhmtKvrWmDQ8ZCg7a1BZAM1NS69YmtBJWGlTwAmzUB6HuTmb3Vz2r6ig9Xz9ZADDDXauxFCry47Fgh51yS1JCeo295w2V"
 ad_account_id = "act_2945173505586523"
 pixel_id = "466400552489809"  # Replace this with your actual Facebook Pixel ID
-
 FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
-def parse_config(config_text):
-    config = {}
-    lines = config_text.strip().split('\n')
-    for line in lines:
-        key, value = line.split(':', 1)
-        config[key.strip()] = value.strip()
-    return config
+# Replace this with your actual Facebook Page ID
+facebook_page_id = "102076431877514"
 
-@app.route('/create_campaign', methods=['POST'])
-def create_campaign():
-    data = request.form
-    campaign_name = data.get('campaign_name')
-    campaign_id = data.get('campaign_id')
-    folder_path = data.get('folder_path')
-
-    config_text = data.get('config_text')
-    if config_text:
-        config = parse_config(config_text)
-    else:
-        config = {
-            'facebook_page_id': '102076431877514',
-            'Headline': 'No More Neuropathic Foot Pain',
-            'link': 'https://kyronaclinic.com/pages/review-1',
-            'utm_parameters': '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'
-        }
-
-    facebook_page_id = config.get('facebook_page_id')
-    headline = config.get('Headline')
-    base_link = config.get('link')
-    utm_parameters = config.get('utm_parameters')
-
-    if campaign_id:
-        campaign = AdAccount(ad_account_id).get_campaigns(params={"fields": ["id", "name"]})
-        campaign = next((c for c in campaign if c['id'] == campaign_id), None)
-        if not campaign:
-            return jsonify({"error": "Campaign ID not found"}), 400
-    else:
-        campaign_id, campaign = create_new_campaign(campaign_name)
-        if not campaign_id:
-            return jsonify({"error": "Failed to create campaign"}), 500
-
-    ad_sets = create_ad_sets(campaign_id, campaign_name, folder_path)
-    if not ad_sets:
-        return jsonify({"error": "Failed to create ad sets"}), 500
-
-    process_videos(ad_sets, folder_path, facebook_page_id, headline, base_link, utm_parameters)
-
-    return jsonify({"message": "Campaign and Ad Sets created successfully", "campaign_id": campaign_id, "ad_sets": [ad_set.get_id() for ad_set in ad_sets]})
-
-def create_new_campaign(name):
+def create_campaign(name):
     try:
         campaign = AdAccount(ad_account_id).create_campaign(
             fields=[AdAccount.Field.id],
@@ -92,50 +44,44 @@ def create_new_campaign(name):
         print(f"Error creating campaign: {e}")
         return None, None
 
-def create_ad_sets(campaign_id, folder_name, folder_path):
+def create_ad_set(campaign_id, folder_name, videos):
     try:
-        videos = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
-        num_ads_per_set = 5
-        num_sets = math.ceil(len(videos) / num_ads_per_set)
         start_time = (datetime.now() + timedelta(days=1)).replace(
             hour=4, minute=0, second=0, microsecond=0
         )
-        ad_sets = []
-        for i in range(num_sets):
-            ad_set_name = f"{folder_name} - Ad Set {i+1}"
-            ad_set_params = {
-                "name": ad_set_name,
-                "campaign_id": campaign_id,
-                "billing_event": "IMPRESSIONS",
-                "optimization_goal": "OFFSITE_CONVERSIONS",
-                "daily_budget": 5073,  # Adjust the budget to 50.73 in minor units
-                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                "targeting": {
-                    "geo_locations": {"countries": ["GB"]},
-                    "age_min": 30,
-                    "age_max": 65,
-                    "publisher_platforms": ["facebook"],
-                    "facebook_positions": ["feed", "profile_feed", "video_feeds"]
-                },
-                "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "dynamic_ad_image_enhancement": False,
-                "dynamic_ad_voice_enhancement": False,
-                "promoted_object": {
-                    "pixel_id": pixel_id,
-                    "custom_event_type": "PURCHASE"
-                }
+        ad_set_name = f"{folder_name}"
+        ad_set_params = {
+            "name": ad_set_name,
+            "campaign_id": campaign_id,
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "OFFSITE_CONVERSIONS",
+            "daily_budget": 5073,  # Adjust the budget to 50.73 in minor units
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "targeting": {
+                "geo_locations": {"countries": ["GB"]},
+                "age_min": 30,
+                "age_max": 65,
+                "publisher_platforms": ["facebook"],
+                "facebook_positions": ["feed", "profile_feed", "video_feeds"]
+            },
+            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "dynamic_ad_image_enhancement": False,
+            "dynamic_ad_voice_enhancement": False,
+            "promoted_object": {
+                "pixel_id": pixel_id,
+                "custom_event_type": "PURCHASE"
             }
-            print(f"Ad set parameters: {ad_set_params}")
-            ad_set = AdAccount(ad_account_id).create_ad_set(
-                fields=[AdSet.Field.name],
-                params=ad_set_params,
-            )
-            print(f"Created ad set with ID: {ad_set.get_id()}")
-            ad_sets.append(ad_set)
-        return ad_sets
+        }
+        print(f"Ad set parameters: {ad_set_params}")
+        ad_set = AdAccount(ad_account_id).create_ad_set(
+            fields=[AdSet.Field.name],
+            params=ad_set_params,
+        )
+        print(f"Created ad set with ID: {ad_set.get_id()}")
+        return ad_set
     except Exception as e:
-        print(f"Error creating ad sets: {e}")
-        return []
+        print(f"Error creating ad set: {e}")
+        return None
 
 def upload_video(video_file):
     try:
@@ -190,7 +136,15 @@ def trim_video(input_file, output_file, duration):
     ]
     subprocess.run(command, check=True)
 
-def create_ad(ad_set_id, video_file, facebook_page_id, headline, base_link, utm_parameters):
+def parse_config(config_text):
+    config = {}
+    lines = config_text.strip().split('\n')
+    for line in lines:
+        key, value = line.split(':', 1)
+        config[key.strip()] = value.strip()
+    return config
+
+def create_ad(ad_set_id, video_file, config):
     try:
         video_path = video_file
         thumbnail_path = f"{os.path.splitext(video_file)[0]}.jpg"
@@ -214,10 +168,12 @@ def create_ad(ad_set_id, video_file, facebook_page_id, headline, base_link, utm_
             print(f"Failed to upload video: {video_file}")
             return
         
+        base_link = config['link']
+        utm_parameters = config['utm_parameters']
         link = base_link + utm_parameters
 
         object_story_spec = {
-            "page_id": facebook_page_id,
+            "page_id": config['facebook_page_id'],
             "video_data": {
                 "video_id": video_id,
                 "call_to_action": {
@@ -226,8 +182,19 @@ def create_ad(ad_set_id, video_file, facebook_page_id, headline, base_link, utm_
                         "link": link
                     }
                 },
-                "message": "Finding it difficult to deal with neuropathic foot pain...",
-                "title": headline,
+                "message": ("Finding it difficult to deal with neuropathic foot pain, as well as stiff and painful joints?"
+                            "\n\nNo matter whether your neuropathy is caused by diabetes, chemo-induced, autoimmune disease, or idiopathic conditions... Tingling neuropathy has the potential to completely disrupt your life."
+                            "\n\nIt is essential to take action right now, without delay, before it is too late..."
+                            "\n\nThrough the promotion of blood circulation and the healing of damaged tissue in your foot, the Kyrona Clinics NMES Foot Massager utilises cutting-edge technology that provides almost instantaneous relief from neuropathic foot pain, stiffness, and swelling."
+                            "\n\nTo use it, all you need is fifteen minutes per day, and you can do it from the convenience of your own home."
+                            "\n\nAfter only fourteen days of use, you will experience a significant increase in your level of energy, and you will be able to once again take pleasure in living life to the fullest."
+                            "\n\nIn addition, the Kyrona Clinics NMES Foot Massager comes with a money-back guarantee for a period of 60 Days and free shipping. You will either receive results or see a full refund of your money, guaranteed."
+                            "\n\n✅ Stimulates blood flow"
+                            "\n✅ Naturally promotes nerve regeneration process (no harsh medication)"
+                            "\n✅ Designed & recommended by Dr. Campbell, a top renowned Chicago doctor with over 10 years of experience"
+                            "\n\nGet yours now risk-free> https://kyronaclinic.com/pages/review-1"
+                            "\n\nFast shipping from the UK warehouse - only 4-7 days!"),
+                "title": config['Headline'],
                 "image_hash": image_hash,
                 "link_description": "FREE Shipping & 60-Day Money-Back Guarantee"
             }
@@ -249,7 +216,7 @@ def create_ad(ad_set_id, video_file, facebook_page_id, headline, base_link, utm_
         ad_creative.remote_create()
 
         ad = Ad(parent_id=ad_account_id)
-        ad[Ad.Field.name] = os.path.basename(video_file)
+        ad[Ad.Field.name] = "EMS Slippers Hooks Creative Sandbox"
         ad[Ad.Field.adset_id] = ad_set_id
         ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
         ad[Ad.Field.status] = "PAUSED"
@@ -261,26 +228,69 @@ def create_ad(ad_set_id, video_file, facebook_page_id, headline, base_link, utm_
     except Exception as e:
         print(f"Error creating ad: {e}")
 
-def process_videos(ad_sets, folder_path, facebook_page_id, headline, base_link, utm_parameters):
-    video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
-    if not video_files:
-        print("No video files found in the specified folder.")
-        return
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_video = {executor.submit(create_ad, ad_sets[i // 5].get_id(), video, facebook_page_id, headline, base_link, utm_parameters): video for i, video in enumerate(video_files)}
-        total_videos = len(video_files)
+@app.route('/create_campaign', methods=['POST'])
+def handle_create_campaign():
+    campaign_name = request.form.get('campaign_name')
+    campaign_id = request.form.get('campaign_id')
+    config_text = request.form.get('config_text')
+    upload_folder = request.files.getlist('uploadFolders')
+    
+    if campaign_id:
+        campaign_id = find_campaign_by_id(campaign_id)  # Implement this function
+        if not campaign_id:
+            return jsonify({"error": "Campaign ID not found"}), 404
+    else:
+        campaign_id, campaign = create_campaign(campaign_name)
+        if not campaign_id:
+            return jsonify({"error": "Failed to create campaign"}), 500
+    
+    if config_text:
+        config = parse_config(config_text)
+    else:
+        config = {
+            'facebook_page_id': '102076431877514',
+            'Headline': 'No More Neuropathic Foot Pain',
+            'link': 'https://kyronaclinic.com/pages/review-1',
+            'utm_parameters': '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'
+        }
+    
+    temp_dir = tempfile.mkdtemp()
+    for file in upload_folder:
+        file_path = os.path.join(temp_dir, file.filename)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        if not file.filename.startswith('.'):  # Skip hidden files like .DS_Store
+            file.save(file_path)
+    
+    folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
+    
+    for folder in folders:
+        folder_path = os.path.join(temp_dir, folder)
+        video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
         
-        with tqdm(total=total_videos, desc="Processing videos") as pbar:
-            for future in as_completed(future_to_video):
-                video = future_to_video[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Error processing video {video}: {e}")
-                finally:
-                    pbar.update(1)
+        if not video_files:
+            print(f"No video files found in the folder: {folder}")
+            continue
+        
+        ad_set = create_ad_set(campaign_id, folder, video_files)
+        if not ad_set:
+            continue
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config): video for i, video in enumerate(video_files)}
+            total_videos = len(video_files)
+            
+            with tqdm(total=total_videos, desc=f"Processing videos in {folder}") as pbar:
+                for future in as_completed(future_to_video):
+                    video = future_to_video[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Error processing video {video}: {e}")
+                    finally:
+                        pbar.update(1)
+    
+    return jsonify({"message": "Campaign processed successfully"})
 
 if __name__ == "__main__":
     app.run(debug=True)
-    
+
