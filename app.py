@@ -216,7 +216,7 @@ def create_ad(ad_set_id, video_file, config):
         ad_creative.remote_create()
 
         ad = Ad(parent_id=ad_account_id)
-        ad[Ad.Field.name] = "EMS Slippers Hooks Creative Sandbox"
+        ad[Ad.Field.name] = os.path.basename(video_file)  # Set ad name to video file name
         ad[Ad.Field.adset_id] = ad_set_id
         ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
         ad[Ad.Field.status] = "PAUSED"
@@ -227,6 +227,22 @@ def create_ad(ad_set_id, video_file, config):
         print(f"Created ad with ID: {ad.get_id()}")
     except Exception as e:
         print(f"Error creating ad: {e}")
+
+def find_campaign_by_id(campaign_id):
+    try:
+        campaign = AdAccount(ad_account_id).get_campaigns(
+            fields=['name'],
+            params={
+                'filtering': [{'field': 'id', 'operator': 'EQUAL', 'value': campaign_id}]
+            }
+        )
+        if campaign:
+            return campaign_id
+        else:
+            return None
+    except Exception as e:
+        print(f"Error finding campaign by ID: {e}")
+        return None
 
 @app.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
