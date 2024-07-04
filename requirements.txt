@@ -1,4 +1,5 @@
 facebook-business
 ffmpeg-python
 Flask
-Flask-Cors
+flask-Cors
+tqdm
