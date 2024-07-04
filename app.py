@@ -182,18 +182,7 @@ def create_ad(ad_set_id, video_file, config):
                         "link": link
                     }
                 },
-                "message": ("Finding it difficult to deal with neuropathic foot pain, as well as stiff and painful joints?"
-                            "\n\nNo matter whether your neuropathy is caused by diabetes, chemo-induced, autoimmune disease, or idiopathic conditions... Tingling neuropathy has the potential to completely disrupt your life."
-                            "\n\nIt is essential to take action right now, without delay, before it is too late..."
-                            "\n\nThrough the promotion of blood circulation and the healing of damaged tissue in your foot, the Kyrona Clinics NMES Foot Massager utilises cutting-edge technology that provides almost instantaneous relief from neuropathic foot pain, stiffness, and swelling."
-                            "\n\nTo use it, all you need is fifteen minutes per day, and you can do it from the convenience of your own home."
-                            "\n\nAfter only fourteen days of use, you will experience a significant increase in your level of energy, and you will be able to once again take pleasure in living life to the fullest."
-                            "\n\nIn addition, the Kyrona Clinics NMES Foot Massager comes with a money-back guarantee for a period of 60 Days and free shipping. You will either receive results or see a full refund of your money, guaranteed."
-                            "\n\n✅ Stimulates blood flow"
-                            "\n✅ Naturally promotes nerve regeneration process (no harsh medication)"
-                            "\n✅ Designed & recommended by Dr. Campbell, a top renowned Chicago doctor with over 10 years of experience"
-                            "\n\nGet yours now risk-free> https://kyronaclinic.com/pages/review-1"
-                            "\n\nFast shipping from the UK warehouse - only 4-7 days!"),
+                "message": config.get('Message', 'Default ad message'),
                 "title": config['Headline'],
                 "image_hash": image_hash,
                 "link_description": "FREE Shipping & 60-Day Money-Back Guarantee"
@@ -216,7 +205,8 @@ def create_ad(ad_set_id, video_file, config):
         ad_creative.remote_create()
 
         ad = Ad(parent_id=ad_account_id)
-        ad[Ad.Field.name] = os.path.basename(video_file)  # Set ad name to video file name
+        ad_name = os.path.splitext(os.path.basename(video_file))[0]  # Remove file extension
+        ad[Ad.Field.name] = ad_name
         ad[Ad.Field.adset_id] = ad_set_id
         ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
         ad[Ad.Field.status] = "PAUSED"
