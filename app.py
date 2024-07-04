@@ -27,8 +27,6 @@ pixel_id = "466400552489809"  # Replace this with your actual Facebook Pixel ID
 
 FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
-facebook_page_id = "102076431877514"
-
 def parse_config(config_text):
     config = {}
     lines = config_text.strip().split('\n')
@@ -39,13 +37,22 @@ def parse_config(config_text):
 
 @app.route('/create_campaign', methods=['POST'])
 def create_campaign():
-    data = request.json
+    data = request.form
     campaign_name = data.get('campaign_name')
     campaign_id = data.get('campaign_id')
     folder_path = data.get('folder_path')
-    config_text = data.get('config_text')
 
-    config = parse_config(config_text)
+    config_text = data.get('config_text')
+    if config_text:
+        config = parse_config(config_text)
+    else:
+        config = {
+            'facebook_page_id': '102076431877514',
+            'Headline': 'No More Neuropathic Foot Pain',
+            'link': 'https://kyronaclinic.com/pages/review-1',
+            'utm_parameters': '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'
+        }
+
     facebook_page_id = config.get('facebook_page_id')
     headline = config.get('Headline')
     base_link = config.get('link')
@@ -276,3 +283,4 @@ def process_videos(ad_sets, folder_path, facebook_page_id, headline, base_link, 
 
 if __name__ == "__main__":
     app.run(debug=True)
+    
