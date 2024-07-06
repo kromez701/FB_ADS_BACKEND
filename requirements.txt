@@ -6,3 +6,4 @@ tqdm==4.62.3
 facebook-business==13.0.0
 python-socketio==5.3.0
 eventlet==0.31.0
+werkzeug==2.0.3
