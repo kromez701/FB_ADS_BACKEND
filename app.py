@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import os
-import zipfile
 import tempfile
 import subprocess
 from datetime import datetime, timedelta
