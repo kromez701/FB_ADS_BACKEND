@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import os
+import zipfile
 import tempfile
 import subprocess
 from datetime import datetime, timedelta
@@ -50,7 +51,7 @@ def create_campaign(name):
         print(f"Created campaign with ID: {campaign.get_id()}")
         return campaign.get_id(), campaign
     except Exception as e:
-        print(f"Error creating campaign: {e}")
+        print("Error creating campaign.")
         return None, None
 
 def create_ad_set(campaign_id, folder_name, videos):
@@ -89,7 +90,7 @@ def create_ad_set(campaign_id, folder_name, videos):
         print(f"Created ad set with ID: {ad_set.get_id()}")
         return ad_set
     except Exception as e:
-        print(f"Error creating ad set: {e}")
+        print("Error creating ad set.")
         return None
 
 def upload_video(video_file, task_id):
@@ -101,7 +102,7 @@ def upload_video(video_file, task_id):
         print(f"Uploaded video with ID: {video.get_id()}")
         return video.get_id()
     except Exception as e:
-        print(f"Error uploading video: {e}")
+        print("Error uploading video.")
         return None
 
 def generate_thumbnail(video_file, thumbnail_file, task_id):
@@ -124,7 +125,7 @@ def upload_image(image_file, task_id):
         print(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
         return image[AdImage.Field.hash]
     except Exception as e:
-        print(f"Error uploading image: {e}")
+        print("Error uploading image.")
         return None
 
 def get_video_duration(video_file, task_id):
@@ -244,8 +245,8 @@ def create_ad(ad_set_id, video_file, config, task_id):
     except TaskCanceledException:
         print(f"Task {task_id} has been canceled during ad creation.")
     except Exception as e:
-        print(f"Error creating ad: {e}")
-        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+        print("Error creating ad.")
+        socketio.emit('error', {'task_id': task_id, 'message': "Error creating ad"})
 
 def find_campaign_by_id(campaign_id):
     try:
@@ -260,7 +261,7 @@ def find_campaign_by_id(campaign_id):
         else:
             return None
     except Exception as e:
-        print(f"Error finding campaign by ID: {e}")
+        print("Error finding campaign by ID.")
         return None
 
 def check_cancellation(task_id):
@@ -354,8 +355,8 @@ def handle_create_campaign():
                                 print(f"Task {task_id} has been canceled during processing video {video}.")
                                 return
                             except Exception as e:
-                                print(f"Error processing video {video}: {e}")
-                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                print("Error processing video.")
+                                socketio.emit('error', {'task_id': task_id, 'message': "Error processing video"})
                             finally:
                                 pbar.update(1)
                                 socketio.emit('progress', {'task_id': task_id, 'progress': pbar.n / total_videos * 100, 'step': f"{pbar.n}/{total_videos}"})
@@ -367,8 +368,8 @@ def handle_create_campaign():
         except TaskCanceledException:
             print(f"Task {task_id} has been canceled during video processing.")
         except Exception as e:
-            print(f"Error in processing videos: {e}")
-            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            print("Error in processing videos.")
+            socketio.emit('error', {'task_id': task_id, 'message': "Error in processing videos"})
 
     with tasks_lock:
         upload_tasks[task_id] = True
@@ -388,7 +389,7 @@ def cancel_task():
                 return jsonify({"message": "Task canceled"})
         return jsonify({"error": "Task ID not found"}), 404
     except Exception as e:
-        print(f"Error handling cancel task request: {e}")
+        print("Error handling cancel task request.")
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
