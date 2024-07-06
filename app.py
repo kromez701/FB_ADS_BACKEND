@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 import os
+import zipfile
 import tempfile
 import subprocess
 from datetime import datetime, timedelta
@@ -13,9 +15,11 @@ from facebook_business.adobjects.adcreative import AdCreative
 from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
+from threading import Lock
 
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize Facebook Ads API
 app_id = "314691374966102"
@@ -27,6 +31,12 @@ FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
 # Replace this with your actual Facebook Page ID
 facebook_page_id = "102076431877514"
+
+upload_tasks = {}
+tasks_lock = Lock()
+
+class TaskCanceledException(Exception):
+    pass
 
 def create_campaign(name):
     try:
@@ -49,7 +59,7 @@ def create_ad_set(campaign_id, folder_name, videos):
         start_time = (datetime.now() + timedelta(days=1)).replace(
             hour=4, minute=0, second=0, microsecond=0
         )
-        ad_set_name = f"{folder_name}"
+        ad_set_name = folder_name
         ad_set_params = {
             "name": ad_set_name,
             "campaign_id": campaign_id,
@@ -83,7 +93,8 @@ def create_ad_set(campaign_id, folder_name, videos):
         print(f"Error creating ad set: {e}")
         return None
 
-def upload_video(video_file):
+def upload_video(video_file, task_id):
+    check_cancellation(task_id)
     try:
         video = AdVideo(parent_id=ad_account_id)
         video[AdVideo.Field.filepath] = video_file
@@ -94,7 +105,8 @@ def upload_video(video_file):
         print(f"Error uploading video: {e}")
         return None
 
-def generate_thumbnail(video_file, thumbnail_file):
+def generate_thumbnail(video_file, thumbnail_file, task_id):
+    check_cancellation(task_id)
     command = [
         'ffmpeg',
         '-i', video_file,
@@ -104,7 +116,8 @@ def generate_thumbnail(video_file, thumbnail_file):
     ]
     subprocess.run(command, check=True)
 
-def upload_image(image_file):
+def upload_image(image_file, task_id):
+    check_cancellation(task_id)
     try:
         image = AdImage(parent_id=ad_account_id)
         image[AdImage.Field.filename] = image_file
@@ -115,7 +128,8 @@ def upload_image(image_file):
         print(f"Error uploading image: {e}")
         return None
 
-def get_video_duration(video_file):
+def get_video_duration(video_file, task_id):
+    check_cancellation(task_id)
     command = [
         'ffprobe',
         '-v', 'error',
@@ -126,7 +140,8 @@ def get_video_duration(video_file):
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     return float(result.stdout)
 
-def trim_video(input_file, output_file, duration):
+def trim_video(input_file, output_file, duration, task_id):
+    check_cancellation(task_id)
     command = [
         'ffmpeg',
         '-i', input_file,
@@ -144,26 +159,27 @@ def parse_config(config_text):
         config[key.strip()] = value.strip()
     return config
 
-def create_ad(ad_set_id, video_file, config):
+def create_ad(ad_set_id, video_file, config, task_id):
     try:
+        check_cancellation(task_id)
         video_path = video_file
         thumbnail_path = f"{os.path.splitext(video_file)[0]}.jpg"
         
-        generate_thumbnail(video_path, thumbnail_path)
-        image_hash = upload_image(thumbnail_path)
+        generate_thumbnail(video_path, thumbnail_path, task_id)
+        image_hash = upload_image(thumbnail_path, task_id)
         
         if not image_hash:
             print(f"Failed to upload thumbnail: {thumbnail_path}")
             return
 
         max_duration = 240 * 60  # 240 minutes
-        video_duration = get_video_duration(video_path)
+        video_duration = get_video_duration(video_path, task_id)
         if video_duration > max_duration:
             trimmed_video_path = f"./trimmed_{os.path.basename(video_file)}"
-            trim_video(video_path, trimmed_video_path, max_duration)
+            trim_video(video_path, trimmed_video_path, max_duration, task_id)
             video_path = trimmed_video_path
 
-        video_id = upload_video(video_path)
+        video_id = upload_video(video_path, task_id)
         if not video_id:
             print(f"Failed to upload video: {video_file}")
             return
@@ -194,7 +210,7 @@ def create_ad(ad_set_id, video_file, config):
                             "\n✅ Designed & recommended by Dr. Campbell, a top renowned Chicago doctor with over 10 years of experience"
                             "\n\nGet yours now risk-free> https://kyronaclinic.com/pages/review-1"
                             "\n\nFast shipping from the UK warehouse - only 4-7 days!"),
-                "title": config['Headline'],
+                "title": config['headline'],
                 "image_hash": image_hash,
                 "link_description": "FREE Shipping & 60-Day Money-Back Guarantee"
             }
@@ -226,8 +242,11 @@ def create_ad(ad_set_id, video_file, config):
         os.remove(thumbnail_path)
         
         print(f"Created ad with ID: {ad.get_id()}")
+    except TaskCanceledException:
+        print(f"Task {task_id} has been canceled during ad creation.")
     except Exception as e:
         print(f"Error creating ad: {e}")
+        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
 
 def find_campaign_by_id(campaign_id):
     try:
@@ -245,15 +264,29 @@ def find_campaign_by_id(campaign_id):
         print(f"Error finding campaign by ID: {e}")
         return None
 
+def check_cancellation(task_id):
+    with tasks_lock:
+        if not upload_tasks.get(task_id, True):
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+
+def get_all_video_files(directory):
+    video_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.mp4', '.mov', '.avi')):
+                video_files.append(os.path.join(root, file))
+    return video_files
+
 @app.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
     campaign_name = request.form.get('campaign_name')
     campaign_id = request.form.get('campaign_id')
     config_text = request.form.get('config_text')
     upload_folder = request.files.getlist('uploadFolders')
-    
+    task_id = request.form.get('task_id')
+
     if campaign_id:
-        campaign_id = find_campaign_by_id(campaign_id)  # Implement this function
+        campaign_id = find_campaign_by_id(campaign_id)
         if not campaign_id:
             return jsonify({"error": "Campaign ID not found"}), 404
     else:
@@ -261,16 +294,13 @@ def handle_create_campaign():
         if not campaign_id:
             return jsonify({"error": "Failed to create campaign"}), 500
     
-    if config_text:
-        config = parse_config(config_text)
-    else:
-        config = {
-            'facebook_page_id': '102076431877514',
-            'Headline': 'No More Neuropathic Foot Pain',
-            'link': 'https://kyronaclinic.com/pages/review-1',
-            'utm_parameters': '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'
-        }
-    
+    config = {
+        'facebook_page_id': request.form.get('facebook_page_id', '102076431877514'),
+        'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
+        'link': request.form.get('link', 'https://kyronaclinic.com/pages/review-1'),
+        'utm_parameters': request.form.get('utm_parameters', '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
+    }
+
     temp_dir = tempfile.mkdtemp()
     for file in upload_folder:
         file_path = os.path.join(temp_dir, file.filename)
@@ -280,34 +310,87 @@ def handle_create_campaign():
     
     folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
     
+    total_videos = 0
     for folder in folders:
         folder_path = os.path.join(temp_dir, folder)
-        video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
-        
-        if not video_files:
-            print(f"No video files found in the folder: {folder}")
-            continue
-        
-        ad_set = create_ad_set(campaign_id, folder, video_files)
-        if not ad_set:
-            continue
-        
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config): video for i, video in enumerate(video_files)}
-            total_videos = len(video_files)
+        video_files = get_all_video_files(folder_path)
+        total_videos += len(video_files)
+
+    if task_id in upload_tasks:
+        del upload_tasks[task_id]
+
+    def process_videos(task_id, campaign_id, folders, config):
+        try:
+            total_videos = 0
+            for folder in folders:
+                folder_path = os.path.join(temp_dir, folder)
+                video_files = get_all_video_files(folder_path)
+                total_videos += len(video_files)
             
-            with tqdm(total=total_videos, desc=f"Processing videos in {folder}") as pbar:
-                for future in as_completed(future_to_video):
-                    video = future_to_video[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"Error processing video {video}: {e}")
-                    finally:
-                        pbar.update(1)
+            socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_videos}"})
+
+            for folder in folders:
+                check_cancellation(task_id)
+                folder_path = os.path.join(temp_dir, folder)
+                video_files = get_all_video_files(folder_path)
+                
+                if not video_files:
+                    print(f"No video files found in the folder: {folder}")
+                    continue
+                
+                ad_set = create_ad_set(campaign_id, folder, video_files)
+                if not ad_set:
+                    continue
+                
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
+                    
+                    with tqdm(total=total_videos, desc=f"Processing videos in {folder}") as pbar:
+                        for future in as_completed(future_to_video):
+                            check_cancellation(task_id)
+                            video = future_to_video[future]
+                            try:
+                                future.result()
+                            except TaskCanceledException:
+                                print(f"Task {task_id} has been canceled during processing video {video}.")
+                                return
+                            except Exception as e:
+                                print(f"Error processing video {video}: {e}")
+                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                            finally:
+                                pbar.update(1)
+                                socketio.emit('progress', {'task_id': task_id, 'progress': pbar.n / total_videos * 100, 'step': f"{pbar.n}/{total_videos}"})
+                            
+                            # Check for task cancellation
+                            check_cancellation(task_id)
+
+            socketio.emit('task_complete', {'task_id': task_id})
+        except TaskCanceledException:
+            print(f"Task {task_id} has been canceled during video processing.")
+        except Exception as e:
+            print(f"Error in processing videos: {e}")
+            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+
+    with tasks_lock:
+        upload_tasks[task_id] = True
+    socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config)
     
-    return jsonify({"message": "Campaign processed successfully"})
+    return jsonify({"message": "Campaign processing started", "task_id": task_id})
+
+@app.route('/cancel_task', methods=['POST'])
+def cancel_task():
+    try:
+        task_id = request.json.get('task_id')
+        print(f"Received request to cancel task: {task_id}")
+        with tasks_lock:
+            if task_id in upload_tasks:
+                upload_tasks[task_id] = False
+                print(f"Task {task_id} set to be canceled")
+                return jsonify({"message": "Task canceled"})
+        return jsonify({"error": "Task ID not found"}), 404
+    except Exception as e:
+        print(f"Error handling cancel task request: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0')
-
+    socketio.run(app, debug=True, host='0.0.0.0')
