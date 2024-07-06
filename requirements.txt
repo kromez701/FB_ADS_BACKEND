@@ -1,5 +1,8 @@
-facebook-business
-ffmpeg-python
 Flask
-flask-Cors
+Flask-Cors
+flask-socketio
+requests
 tqdm
+facebook-busines
+python-socketio
+eventlet
