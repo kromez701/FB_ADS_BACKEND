@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import os
-import zipfile
 import tempfile
 import subprocess
 from datetime import datetime, timedelta
@@ -16,6 +15,7 @@ from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
+import signal
 
 app = Flask(__name__)
 CORS(app)
@@ -34,6 +34,7 @@ facebook_page_id = "102076431877514"
 
 upload_tasks = {}
 tasks_lock = Lock()
+process_pids = {}
 
 class TaskCanceledException(Exception):
     pass
@@ -51,7 +52,7 @@ def create_campaign(name):
         print(f"Created campaign with ID: {campaign.get_id()}")
         return campaign.get_id(), campaign
     except Exception as e:
-        print("Error creating campaign.")
+        print(f"Error creating campaign: {e}")
         return None, None
 
 def create_ad_set(campaign_id, folder_name, videos):
@@ -90,7 +91,7 @@ def create_ad_set(campaign_id, folder_name, videos):
         print(f"Created ad set with ID: {ad_set.get_id()}")
         return ad_set
     except Exception as e:
-        print("Error creating ad set.")
+        print(f"Error creating ad set: {e}")
         return None
 
 def upload_video(video_file, task_id):
@@ -102,7 +103,7 @@ def upload_video(video_file, task_id):
         print(f"Uploaded video with ID: {video.get_id()}")
         return video.get_id()
     except Exception as e:
-        print("Error uploading video.")
+        print(f"Error uploading video: {e}")
         return None
 
 def generate_thumbnail(video_file, thumbnail_file, task_id):
@@ -114,7 +115,14 @@ def generate_thumbnail(video_file, thumbnail_file, task_id):
         '-vframes', '1',
         thumbnail_file
     ]
-    subprocess.run(command, check=True)
+    proc = subprocess.Popen(command)
+    with tasks_lock:
+        if task_id not in process_pids:
+            process_pids[task_id] = []
+        process_pids[task_id].append(proc.pid)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command)
 
 def upload_image(image_file, task_id):
     check_cancellation(task_id)
@@ -125,7 +133,7 @@ def upload_image(image_file, task_id):
         print(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
         return image[AdImage.Field.hash]
     except Exception as e:
-        print("Error uploading image.")
+        print(f"Error uploading image: {e}")
         return None
 
 def get_video_duration(video_file, task_id):
@@ -137,8 +145,15 @@ def get_video_duration(video_file, task_id):
         '-of', 'default=noprint_wrappers=1:nokey=1',
         video_file
     ]
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    return float(result.stdout)
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with tasks_lock:
+        if task_id not in process_pids:
+            process_pids[task_id] = []
+        process_pids[task_id].append(proc.pid)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command)
+    return float(stdout)
 
 def trim_video(input_file, output_file, duration, task_id):
     check_cancellation(task_id)
@@ -149,7 +164,14 @@ def trim_video(input_file, output_file, duration, task_id):
         '-c', 'copy',
         output_file
     ]
-    subprocess.run(command, check=True)
+    proc = subprocess.Popen(command)
+    with tasks_lock:
+        if task_id not in process_pids:
+            process_pids[task_id] = []
+        process_pids[task_id].append(proc.pid)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command)
 
 def parse_config(config_text):
     config = {}
@@ -245,8 +267,8 @@ def create_ad(ad_set_id, video_file, config, task_id):
     except TaskCanceledException:
         print(f"Task {task_id} has been canceled during ad creation.")
     except Exception as e:
-        print("Error creating ad.")
-        socketio.emit('error', {'task_id': task_id, 'message': "Error creating ad"})
+        print(f"Error creating ad: {e}")
+        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
 
 def find_campaign_by_id(campaign_id):
     try:
@@ -261,7 +283,7 @@ def find_campaign_by_id(campaign_id):
         else:
             return None
     except Exception as e:
-        print("Error finding campaign by ID.")
+        print(f"Error finding campaign by ID: {e}")
         return None
 
 def check_cancellation(task_id):
@@ -284,6 +306,11 @@ def handle_create_campaign():
     config_text = request.form.get('config_text')
     upload_folder = request.files.getlist('uploadFolders')
     task_id = request.form.get('task_id')
+
+    # Track task ID immediately
+    with tasks_lock:
+        upload_tasks[task_id] = True
+        process_pids[task_id] = []
 
     if campaign_id:
         campaign_id = find_campaign_by_id(campaign_id)
@@ -315,9 +342,6 @@ def handle_create_campaign():
         folder_path = os.path.join(temp_dir, folder)
         video_files = get_all_video_files(folder_path)
         total_videos += len(video_files)
-
-    if task_id in upload_tasks:
-        del upload_tasks[task_id]
 
     def process_videos(task_id, campaign_id, folders, config):
         try:
@@ -355,8 +379,8 @@ def handle_create_campaign():
                                 print(f"Task {task_id} has been canceled during processing video {video}.")
                                 return
                             except Exception as e:
-                                print("Error processing video.")
-                                socketio.emit('error', {'task_id': task_id, 'message': "Error processing video"})
+                                print(f"Error processing video {video}: {e}")
+                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
                             finally:
                                 pbar.update(1)
                                 socketio.emit('progress', {'task_id': task_id, 'progress': pbar.n / total_videos * 100, 'step': f"{pbar.n}/{total_videos}"})
@@ -368,11 +392,12 @@ def handle_create_campaign():
         except TaskCanceledException:
             print(f"Task {task_id} has been canceled during video processing.")
         except Exception as e:
-            print("Error in processing videos.")
-            socketio.emit('error', {'task_id': task_id, 'message': "Error in processing videos"})
+            print(f"Error in processing videos: {e}")
+            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+        finally:
+            with tasks_lock:
+                process_pids.pop(task_id, None)
 
-    with tasks_lock:
-        upload_tasks[task_id] = True
     socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config)
     
     return jsonify({"message": "Campaign processing started", "task_id": task_id})
@@ -385,11 +410,18 @@ def cancel_task():
         with tasks_lock:
             if task_id in upload_tasks:
                 upload_tasks[task_id] = False
+                # Kill the PIDs associated with this task
+                for pid in process_pids.get(task_id, []):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                process_pids.pop(task_id, None)
                 print(f"Task {task_id} set to be canceled")
                 return jsonify({"message": "Task canceled"})
         return jsonify({"error": "Task ID not found"}), 404
     except Exception as e:
-        print("Error handling cancel task request.")
+        print(f"Error handling cancel task request: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
