@@ -15,8 +15,7 @@ from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
-
-import tqdm
+from tqdm import tqdm
 
 app = Flask(__name__)
 CORS(app)
