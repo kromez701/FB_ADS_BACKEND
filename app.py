@@ -6,7 +6,6 @@ import tempfile
 import subprocess
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adset import AdSet
@@ -17,29 +16,34 @@ from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
 
+import tqdm
+
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize Facebook Ads API
-app_id = "314691374966102"
-app_secret = "88d92443cfcfc3922cdea79b384a116e"
-access_token = "EAAEeNcueZAVYBO0NvEUMo378SikOh70zuWuWgimHhnE5Vk7ye8sZCaRtu9qQGWNDvlBZBBnZAT6HCuDlNc4OeOSsdSw5qmhhmtKvrWmDQ8ZCg7a1BZAM1NS69YmtBJWGlTwAmzUB6HuTmb3Vz2r6ig9Xz9ZADDDXauxFCry47Fgh51yS1JCeo295w2V"
-ad_account_id = "act_2945173505586523"
-pixel_id = "466400552489809"  # Replace this with your actual Facebook Pixel ID
+app_id = "1164502704759812"
+app_secret = "5d176dbaa5b71a2c8554ef7b0ebb2d96"
+access_token = "EAAQjGZBoOpAQBOZBb6hkntMEcCBJ27DXSKJHCcmSz5BpxlZA80HfKScZCstuc6kMmupAWt1KaubNhCQ09c4mYIYhHnKLVdVELZBjaZCB4awlJnAZAdR6e6qPZAtVd8nZCFZCwTB439jqDeSTKlZBgn11tvSCrXVRvW9qlZA8PIko9zdvaOtSkhkfeaKBxtcgfgZDZD"
+ad_account_id = "act_820964716847008"
+pixel_id = "1164502704759812"  # Replace this with your actual Facebook Pixel ID
+
 FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
 # Replace this with your actual Facebook Page ID
-facebook_page_id = "102076431877514"
+facebook_page_id = "363083913554414"
 
 upload_tasks = {}
 tasks_lock = Lock()
 process_pids = {}
+canceled_tasks = set()
 
 class TaskCanceledException(Exception):
     pass
 
-def create_campaign(name):
+def create_campaign(name, task_id):
+    check_cancellation(task_id)
     try:
         campaign = AdAccount(ad_account_id).create_campaign(
             fields=[AdAccount.Field.id],
@@ -55,7 +59,8 @@ def create_campaign(name):
         print(f"Error creating campaign: {e}")
         return None, None
 
-def create_ad_set(campaign_id, folder_name, videos):
+def create_ad_set(campaign_id, folder_name, videos, task_id):
+    check_cancellation(task_id)
     try:
         start_time = (datetime.now() + timedelta(days=1)).replace(
             hour=4, minute=0, second=0, microsecond=0
@@ -63,25 +68,21 @@ def create_ad_set(campaign_id, folder_name, videos):
         ad_set_name = folder_name
         ad_set_params = {
             "name": ad_set_name,
-            "campaign_id": campaign_id,
-            "billing_event": "IMPRESSIONS",
-            "optimization_goal": "OFFSITE_CONVERSIONS",
-            "daily_budget": 5073,  # Adjust the budget to 50.73 in minor units
-            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-            "targeting": {
-                "geo_locations": {"countries": ["GB"]},
-                "age_min": 30,
-                "age_max": 65,
-                "publisher_platforms": ["facebook"],
-                "facebook_positions": ["feed", "profile_feed", "video_feeds"]
-            },
-            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "dynamic_ad_image_enhancement": False,
-            "dynamic_ad_voice_enhancement": False,
-            "promoted_object": {
-                "pixel_id": pixel_id,
-                "custom_event_type": "PURCHASE"
-            }
+                "campaign_id": campaign_id,
+                "billing_event": "IMPRESSIONS",
+                "optimization_goal": "LINK_CLICKS",
+                "daily_budget": 507300,  # Adjust the budget to 50.73 in minor units
+                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+                "targeting": {
+                    "geo_locations": {"countries": ["GB"]},
+                    "age_min": 30,
+                    "age_max": 65,
+                    "publisher_platforms": ["facebook"],
+                    "facebook_positions": ["feed", "profile_feed", "video_feeds"]
+                },
+                "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "dynamic_ad_image_enhancement": False,
+                "dynamic_ad_voice_enhancement": False
         }
         print(f"Ad set parameters: {ad_set_params}")
         ad_set = AdAccount(ad_account_id).create_ad_set(
@@ -106,24 +107,6 @@ def upload_video(video_file, task_id):
         print(f"Error uploading video: {e}")
         return None
 
-def generate_thumbnail(video_file, thumbnail_file, task_id):
-    check_cancellation(task_id)
-    command = [
-        'ffmpeg',
-        '-i', video_file,
-        '-ss', '00:00:01.000',
-        '-vframes', '1',
-        thumbnail_file
-    ]
-    proc = subprocess.Popen(command)
-    with tasks_lock:
-        if task_id not in process_pids:
-            process_pids[task_id] = []
-        process_pids[task_id].append(proc.pid)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, command)
-
 def upload_image(image_file, task_id):
     check_cancellation(task_id)
     try:
@@ -136,6 +119,37 @@ def upload_image(image_file, task_id):
         print(f"Error uploading image: {e}")
         return None
 
+def generate_thumbnail(video_file, thumbnail_file, task_id):
+    check_cancellation(task_id)
+    command = [
+        'ffmpeg',
+        '-i', video_file,
+        '-ss', '00:00:01.000',
+        '-vframes', '1',
+        thumbnail_file
+    ]
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            if task_id not in process_pids:
+                process_pids[task_id] = []
+            process_pids[task_id].append(proc.pid)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated by signal.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        else:
+            print(f"Error generating thumbnail: {e.cmd} returned non-zero exit status {e.returncode}")
+            print(f"Stdout: {e.output.decode()}")
+            print(f"Stderr: {e.stderr.decode()}")
+            raise
+
 def get_video_duration(video_file, task_id):
     check_cancellation(task_id)
     command = [
@@ -145,15 +159,28 @@ def get_video_duration(video_file, task_id):
         '-of', 'default=noprint_wrappers=1:nokey=1',
         video_file
     ]
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    with tasks_lock:
-        if task_id not in process_pids:
-            process_pids[task_id] = []
-        process_pids[task_id].append(proc.pid)
-    stdout, stderr = proc.communicate()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, command)
-    return float(stdout)
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            if task_id not in process_pids:
+                process_pids[task_id] = []
+            process_pids[task_id].append(proc.pid)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+        return float(stdout)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated by signal.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        else:
+            print(f"Error getting video duration: {e.cmd} returned non-zero exit status {e.returncode}")
+            print(f"Stdout: {e.output.decode()}")
+            print(f"Stderr: {e.stderr.decode()}")
+            raise
 
 def trim_video(input_file, output_file, duration, task_id):
     check_cancellation(task_id)
@@ -164,14 +191,27 @@ def trim_video(input_file, output_file, duration, task_id):
         '-c', 'copy',
         output_file
     ]
-    proc = subprocess.Popen(command)
-    with tasks_lock:
-        if task_id not in process_pids:
-            process_pids[task_id] = []
-        process_pids[task_id].append(proc.pid)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, command)
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            if task_id not in process_pids:
+                process_pids[task_id] = []
+            process_pids[task_id].append(proc.pid)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated by signal.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        else:
+            print(f"Error trimming video: {e.cmd} returned non-zero exit status {e.returncode}")
+            print(f"Stdout: {e.output.decode()}")
+            print(f"Stderr: {e.stderr.decode()}")
+            raise
 
 def parse_config(config_text):
     config = {}
@@ -182,8 +222,8 @@ def parse_config(config_text):
     return config
 
 def create_ad(ad_set_id, video_file, config, task_id):
+    check_cancellation(task_id)
     try:
-        check_cancellation(task_id)
         video_path = video_file
         thumbnail_path = f"{os.path.splitext(video_file)[0]}.jpg"
         
@@ -267,8 +307,11 @@ def create_ad(ad_set_id, video_file, config, task_id):
     except TaskCanceledException:
         print(f"Task {task_id} has been canceled during ad creation.")
     except Exception as e:
-        print(f"Error creating ad: {e}")
-        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+        if isinstance(e, subprocess.CalledProcessError) and e.returncode == -signal.SIGTERM:
+            print(f"Task {task_id} process was terminated by signal.")
+        else:
+            print(f"Error creating ad: {e}")
+            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
 
 def find_campaign_by_id(campaign_id):
     try:
@@ -288,7 +331,8 @@ def find_campaign_by_id(campaign_id):
 
 def check_cancellation(task_id):
     with tasks_lock:
-        if not upload_tasks.get(task_id, True):
+        if task_id in canceled_tasks:
+            canceled_tasks.remove(task_id)
             raise TaskCanceledException(f"Task {task_id} has been canceled")
 
 def get_all_video_files(directory):
@@ -317,12 +361,12 @@ def handle_create_campaign():
         if not campaign_id:
             return jsonify({"error": "Campaign ID not found"}), 404
     else:
-        campaign_id, campaign = create_campaign(campaign_name)
+        campaign_id, campaign = create_campaign(campaign_name, task_id)
         if not campaign_id:
             return jsonify({"error": "Failed to create campaign"}), 500
     
     config = {
-        'facebook_page_id': request.form.get('facebook_page_id', '102076431877514'),
+        'facebook_page_id': request.form.get('facebook_page_id', '363083913554414'),
         'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
         'link': request.form.get('link', 'https://kyronaclinic.com/pages/review-1'),
         'utm_parameters': request.form.get('utm_parameters', '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
@@ -362,7 +406,7 @@ def handle_create_campaign():
                     print(f"No video files found in the folder: {folder}")
                     continue
                 
-                ad_set = create_ad_set(campaign_id, folder, video_files)
+                ad_set = create_ad_set(campaign_id, folder, video_files, task_id)
                 if not ad_set:
                     continue
                 
@@ -408,6 +452,9 @@ def cancel_task():
         task_id = request.json.get('task_id')
         print(f"Received request to cancel task: {task_id}")
         with tasks_lock:
+            if task_id in canceled_tasks:
+                print(f"Task {task_id} already marked for cancellation")
+            canceled_tasks.add(task_id)
             if task_id in upload_tasks:
                 upload_tasks[task_id] = False
                 # Kill the PIDs associated with this task
@@ -418,8 +465,7 @@ def cancel_task():
                         pass
                 process_pids.pop(task_id, None)
                 print(f"Task {task_id} set to be canceled")
-                return jsonify({"message": "Task canceled"})
-        return jsonify({"error": "Task ID not found"}), 404
+        return jsonify({"message": "Task cancellation request processed"}), 200
     except Exception as e:
         print(f"Error handling cancel task request: {e}")
         return jsonify({"error": "Internal server error"}), 500
