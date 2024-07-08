@@ -16,22 +16,22 @@ from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
 from tqdm import tqdm
+import shutil
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize Facebook Ads API
-app_id = "1164502704759812"
-app_secret = "5d176dbaa5b71a2c8554ef7b0ebb2d96"
-access_token = "EAAQjGZBoOpAQBOZBb6hkntMEcCBJ27DXSKJHCcmSz5BpxlZA80HfKScZCstuc6kMmupAWt1KaubNhCQ09c4mYIYhHnKLVdVELZBjaZCB4awlJnAZAdR6e6qPZAtVd8nZCFZCwTB439jqDeSTKlZBgn11tvSCrXVRvW9qlZA8PIko9zdvaOtSkhkfeaKBxtcgfgZDZD"
-ad_account_id = "act_820964716847008"
-pixel_id = "1164502704759812"  # Replace this with your actual Facebook Pixel ID
-
+app_id = "314691374966102"
+app_secret = "88d92443cfcfc3922cdea79b384a116e"
+access_token = "EAAEeNcueZAVYBO0NvEUMo378SikOh70zuWuWgimHhnE5Vk7ye8sZCaRtu9qQGWNDvlBZBBnZAT6HCuDlNc4OeOSsdSw5qmhhmtKvrWmDQ8ZCg7a1BZAM1NS69YmtBJWGlTwAmzUB6HuTmb3Vz2r6ig9Xz9ZADDDXauxFCry47Fgh51yS1JCeo295w2V"
+ad_account_id = "act_2945173505586523"
+pixel_id = "466400552489809"  # Replace this with your actual Facebook Pixel ID
 FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
 # Replace this with your actual Facebook Page ID
-facebook_page_id = "363083913554414"
+facebook_page_id = "102076431877514"
 
 upload_tasks = {}
 tasks_lock = Lock()
@@ -67,21 +67,25 @@ def create_ad_set(campaign_id, folder_name, videos, task_id):
         ad_set_name = folder_name
         ad_set_params = {
             "name": ad_set_name,
-                "campaign_id": campaign_id,
-                "billing_event": "IMPRESSIONS",
-                "optimization_goal": "LINK_CLICKS",
-                "daily_budget": 507300,  # Adjust the budget to 50.73 in minor units
-                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                "targeting": {
-                    "geo_locations": {"countries": ["GB"]},
-                    "age_min": 30,
-                    "age_max": 65,
-                    "publisher_platforms": ["facebook"],
-                    "facebook_positions": ["feed", "profile_feed", "video_feeds"]
-                },
-                "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "dynamic_ad_image_enhancement": False,
-                "dynamic_ad_voice_enhancement": False
+            "campaign_id": campaign_id,
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "OFFSITE_CONVERSIONS",
+            "daily_budget": 5073,  # Adjust the budget to 50.73 in minor units
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "targeting": {
+                "geo_locations": {"countries": ["GB"]},
+                "age_min": 30,
+                "age_max": 65,
+                "publisher_platforms": ["facebook"],
+                "facebook_positions": ["feed", "profile_feed", "video_feeds"]
+            },
+            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "dynamic_ad_image_enhancement": False,
+            "dynamic_ad_voice_enhancement": False,
+            "promoted_object": {
+                "pixel_id": pixel_id,
+                "custom_event_type": "PURCHASE"
+            }
         }
         print(f"Ad set parameters: {ad_set_params}")
         ad_set = AdAccount(ad_account_id).create_ad_set(
@@ -125,6 +129,7 @@ def generate_thumbnail(video_file, thumbnail_file, task_id):
         '-i', video_file,
         '-ss', '00:00:01.000',
         '-vframes', '1',
+        '-update', '1',  # Ensure single image output
         thumbnail_file
     ]
     try:
@@ -365,7 +370,7 @@ def handle_create_campaign():
             return jsonify({"error": "Failed to create campaign"}), 500
     
     config = {
-        'facebook_page_id': request.form.get('facebook_page_id', '363083913554414'),
+        'facebook_page_id': request.form.get('facebook_page_id', '102076431877514'),
         'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
         'link': request.form.get('link', 'https://kyronaclinic.com/pages/review-1'),
         'utm_parameters': request.form.get('utm_parameters', '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
@@ -379,57 +384,88 @@ def handle_create_campaign():
             file.save(file_path)
     
     folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
-    
+
+    # Check if any folder has subfolders
+    def has_subfolders(folder):
+        for item in os.listdir(folder):
+            item_path = os.path.join(folder, item)
+            if os.path.isdir(item_path):
+                return True
+        return False
+
     total_videos = 0
     for folder in folders:
         folder_path = os.path.join(temp_dir, folder)
-        video_files = get_all_video_files(folder_path)
-        total_videos += len(video_files)
+        total_videos += len(get_all_video_files(folder_path))
 
-    def process_videos(task_id, campaign_id, folders, config):
+    def process_videos(task_id, campaign_id, folders, config, total_videos):
         try:
-            total_videos = 0
-            for folder in folders:
-                folder_path = os.path.join(temp_dir, folder)
-                video_files = get_all_video_files(folder_path)
-                total_videos += len(video_files)
-            
             socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_videos}"})
+            processed_videos = 0
 
-            for folder in folders:
-                check_cancellation(task_id)
-                folder_path = os.path.join(temp_dir, folder)
-                video_files = get_all_video_files(folder_path)
-                
-                if not video_files:
-                    print(f"No video files found in the folder: {folder}")
-                    continue
-                
-                ad_set = create_ad_set(campaign_id, folder, video_files, task_id)
-                if not ad_set:
-                    continue
-                
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
-                    
-                    with tqdm(total=total_videos, desc=f"Processing videos in {folder}") as pbar:
-                        for future in as_completed(future_to_video):
-                            check_cancellation(task_id)
-                            video = future_to_video[future]
-                            try:
-                                future.result()
-                            except TaskCanceledException:
-                                print(f"Task {task_id} has been canceled during processing video {video}.")
-                                return
-                            except Exception as e:
-                                print(f"Error processing video {video}: {e}")
-                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
-                            finally:
-                                pbar.update(1)
-                                socketio.emit('progress', {'task_id': task_id, 'progress': pbar.n / total_videos * 100, 'step': f"{pbar.n}/{total_videos}"})
-                            
-                            # Check for task cancellation
-                            check_cancellation(task_id)
+            with tqdm(total=total_videos, desc="Processing videos") as pbar:
+                for folder in folders:
+                    check_cancellation(task_id)
+                    folder_path = os.path.join(temp_dir, folder)
+
+                    if has_subfolders(folder_path):
+                        for subfolder in os.listdir(folder_path):
+                            subfolder_path = os.path.join(folder_path, subfolder)
+                            if os.path.isdir(subfolder_path):
+                                video_files = get_all_video_files(subfolder_path)
+                                if not video_files:
+                                    continue
+
+                                ad_set = create_ad_set(campaign_id, subfolder, video_files, task_id)
+                                if not ad_set:
+                                    continue
+
+                                with ThreadPoolExecutor(max_workers=5) as executor:
+                                    future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
+
+                                    for future in as_completed(future_to_video):
+                                        check_cancellation(task_id)
+                                        video = future_to_video[future]
+                                        try:
+                                            future.result()
+                                        except TaskCanceledException:
+                                            print(f"Task {task_id} has been canceled during processing video {video}.")
+                                            return
+                                        except Exception as e:
+                                            print(f"Error processing video {video}: {e}")
+                                            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                        finally:
+                                            processed_videos += 1
+                                            pbar.update(1)
+                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+
+                    else:
+                        video_files = get_all_video_files(folder_path)
+                        if not video_files:
+                            continue
+
+                        ad_set = create_ad_set(campaign_id, folder, video_files, task_id)
+                        if not ad_set:
+                            continue
+
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
+
+                            for future in as_completed(future_to_video):
+                                check_cancellation(task_id)
+                                video = future_to_video[future]
+                                try:
+                                    future.result()
+                                except TaskCanceledException:
+                                    print(f"Task {task_id} has been canceled during processing video {video}.")
+                                    return
+                                except Exception as e:
+                                    print(f"Error processing video {video}: {e}")
+                                    socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                finally:
+                                    processed_videos += 1
+                                    pbar.update(1)
+                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
 
             socketio.emit('task_complete', {'task_id': task_id})
         except TaskCanceledException:
@@ -440,9 +476,11 @@ def handle_create_campaign():
         finally:
             with tasks_lock:
                 process_pids.pop(task_id, None)
+            # Clean up temporary files
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-    socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config)
-    
+    socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
+
     return jsonify({"message": "Campaign processing started", "task_id": task_id})
 
 @app.route('/cancel_task', methods=['POST'])
