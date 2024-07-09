@@ -17,6 +17,7 @@ from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
 from tqdm import tqdm
+import time  # Add this import
 
 app = Flask(__name__)
 CORS(app)
@@ -401,6 +402,7 @@ def handle_create_campaign():
             processed_videos = 0
 
             with tqdm(total=total_videos, desc="Processing videos") as pbar:
+                last_update_time = time.time()  # Initialize the last update time
                 for folder in folders:
                     check_cancellation(task_id)
                     folder_path = os.path.join(temp_dir, folder)
@@ -434,7 +436,12 @@ def handle_create_campaign():
                                         finally:
                                             processed_videos += 1
                                             pbar.update(1)
-                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+                                            
+                                            # Periodically emit progress updates
+                                            current_time = time.time()
+                                            if current_time - last_update_time >= 0.5:  # Update every 0.5 seconds
+                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+                                                last_update_time = current_time
 
                     else:
                         video_files = get_all_video_files(folder_path)
@@ -462,8 +469,14 @@ def handle_create_campaign():
                                 finally:
                                     processed_videos += 1
                                     pbar.update(1)
-                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+                                    
+                                    # Periodically emit progress updates
+                                    current_time = time.time()
+                                    if current_time - last_update_time >= 0.5:  # Update every 0.5 seconds
+                                        socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+                                        last_update_time = current_time
 
+            socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_videos}/{total_videos}"})
             socketio.emit('task_complete', {'task_id': task_id})
         except TaskCanceledException:
             print(f"Task {task_id} has been canceled during video processing.")
