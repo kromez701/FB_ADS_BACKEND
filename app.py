@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+import shutil
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import os
@@ -16,22 +17,22 @@ from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
 from tqdm import tqdm
-import shutil
 
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize Facebook Ads API
-app_id = "314691374966102"
-app_secret = "88d92443cfcfc3922cdea79b384a116e"
-access_token = "EAAEeNcueZAVYBO0NvEUMo378SikOh70zuWuWgimHhnE5Vk7ye8sZCaRtu9qQGWNDvlBZBBnZAT6HCuDlNc4OeOSsdSw5qmhhmtKvrWmDQ8ZCg7a1BZAM1NS69YmtBJWGlTwAmzUB6HuTmb3Vz2r6ig9Xz9ZADDDXauxFCry47Fgh51yS1JCeo295w2V"
-ad_account_id = "act_2945173505586523"
-pixel_id = "466400552489809"  # Replace this with your actual Facebook Pixel ID
+app_id = "1164502704759812"
+app_secret = "5d176dbaa5b71a2c8554ef7b0ebb2d96"
+access_token = "EAAQjGZBoOpAQBOZBb6hkntMEcCBJ27DXSKJHCcmSz5BpxlZA80HfKScZCstuc6kMmupAWt1KaubNhCQ09c4mYIYhHnKLVdVELZBjaZCB4awlJnAZAdR6e6qPZAtVd8nZCFZCwTB439jqDeSTKlZBgn11tvSCrXVRvW9qlZA8PIko9zdvaOtSkhkfeaKBxtcgfgZDZD"
+ad_account_id = "act_820964716847008"
+pixel_id = "1164502704759812"  # Replace this with your actual Facebook Pixel ID
+
 FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
 
 # Replace this with your actual Facebook Page ID
-facebook_page_id = "102076431877514"
+facebook_page_id = "363083913554414"
 
 upload_tasks = {}
 tasks_lock = Lock()
@@ -67,27 +68,23 @@ def create_ad_set(campaign_id, folder_name, videos, task_id):
         ad_set_name = folder_name
         ad_set_params = {
             "name": ad_set_name,
-            "campaign_id": campaign_id,
-            "billing_event": "IMPRESSIONS",
-            "optimization_goal": "OFFSITE_CONVERSIONS",
-            "daily_budget": 5073,  # Adjust the budget to 50.73 in minor units
-            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-            "targeting": {
-                "geo_locations": {"countries": ["GB"]},
-                "age_min": 30,
-                "age_max": 65,
-                "publisher_platforms": ["facebook"],
-                "facebook_positions": ["feed", "profile_feed", "video_feeds"]
-            },
-            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "dynamic_ad_image_enhancement": False,
-            "dynamic_ad_voice_enhancement": False,
-            "promoted_object": {
-                "pixel_id": pixel_id,
-                "custom_event_type": "PURCHASE"
-            }
+                "campaign_id": campaign_id,
+                "billing_event": "IMPRESSIONS",
+                "optimization_goal": "LINK_CLICKS",
+                "daily_budget": 507300,  # Adjust the budget to 50.73 in minor units
+                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+                "targeting": {
+                    "geo_locations": {"countries": ["GB"]},
+                    "age_min": 30,
+                    "age_max": 65,
+                    "publisher_platforms": ["facebook"],
+                    "facebook_positions": ["feed", "profile_feed", "video_feeds"]
+                },
+                "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "dynamic_ad_image_enhancement": False,
+                "dynamic_ad_voice_enhancement": False
         }
-        print(f"Ad set parameters: {ad_set_params}")
+        # print(f"Ad set parameters: {ad_set_params}")
         ad_set = AdAccount(ad_account_id).create_ad_set(
             fields=[AdSet.Field.name],
             params=ad_set_params,
@@ -370,7 +367,7 @@ def handle_create_campaign():
             return jsonify({"error": "Failed to create campaign"}), 500
     
     config = {
-        'facebook_page_id': request.form.get('facebook_page_id', '102076431877514'),
+        'facebook_page_id': request.form.get('facebook_page_id', '363083913554414'),
         'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
         'link': request.form.get('link', 'https://kyronaclinic.com/pages/review-1'),
         'utm_parameters': request.form.get('utm_parameters', '?utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
