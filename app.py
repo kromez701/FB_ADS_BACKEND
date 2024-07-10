@@ -472,7 +472,8 @@ def handle_create_campaign():
                                     
                                     # Periodically emit progress updates
                                     current_time = time.time()
-                                    if current_time - last_update_time >= 0.5:  # Update every 0.5 seconds
+                                    if current_time - last_update_time >= 0.5:
+                                        print(f"Emitting progress: {processed_videos / total_videos * 100}% ({processed_videos}/{total_videos})")  # Add this line
                                         socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
                                         last_update_time = current_time
 
