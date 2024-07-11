@@ -1,10 +1,6 @@
 import logging
 import eventlet
 
-# Configure logging before monkey-patching
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
 # Now monkey-patch with eventlet
 eventlet.monkey_patch()
 
