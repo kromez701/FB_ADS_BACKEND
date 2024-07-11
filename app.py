@@ -1,3 +1,13 @@
+import logging
+import eventlet
+
+# Configure logging before monkey-patching
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Now monkey-patch with eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 import shutil
 from flask_cors import CORS
@@ -17,7 +27,7 @@ from facebook_business.adobjects.adimage import AdImage
 from threading import Lock
 import signal
 from tqdm import tqdm
-import time  # Add this import
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -472,8 +482,7 @@ def handle_create_campaign():
                                     
                                     # Periodically emit progress updates
                                     current_time = time.time()
-                                    if current_time - last_update_time >= 0.5:
-                                        print(f"Emitting progress: {processed_videos / total_videos * 100}% ({processed_videos}/{total_videos})")  # Add this line
+                                    if current_time - last_update_time >= 0.5:  # Update every 0.5 seconds
                                         socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
                                         last_update_time = current_time
 
