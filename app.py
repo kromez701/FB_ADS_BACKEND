@@ -26,7 +26,6 @@ import signal
 from tqdm import tqdm
 from datetime import datetime, timedelta, timezone
 
-
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -56,7 +55,7 @@ def create_campaign(name, objective, campaign_budget_optimization, budget_value,
             campaign_params["daily_budget"] = budget_value_cents if campaign_budget_optimization == "DAILY_BUDGET" else None
             campaign_params["lifetime_budget"] = budget_value_cents if campaign_budget_optimization == "LIFETIME_BUDGET" else None
             campaign_params["bid_strategy"] = bid_strategy if campaign_budget_optimization != "AD_SET_BUDGET_OPTIMIZATION" else None
-
+            
         campaign = AdAccount(ad_account_id).create_campaign(
             fields=[AdAccount.Field.id],
             params=campaign_params,
@@ -121,18 +120,51 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             }
         }
 
+        # Include bid_amount if bid_strategy is COST_CAP or LOWEST_COST_WITH_BID_CAP
+        if config.get('ad_set_bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP'] or config.get('bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']:
+            print(f"Including bid amount. Ad set bid strategy: {config.get('ad_set_bid_strategy')}, Bid strategy: {config.get('bid_strategy')}")
+            bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
+            ad_set_params["bid_amount"] = bid_amount_cents
+            print(f"Converted bid amount to cents: {bid_amount_cents}")
+
         if config.get('campaign_budget_optimization') == 'AD_SET_BUDGET_OPTIMIZATION':
-            ad_set_params["bid_strategy"] = config.get('ad_set_bid_strategy', 'LOWEST_COST_WITHOUT_CAP')
+            # Set bid_strategy to None if buying type is RESERVED
+            if config.get('buying_type') == 'RESERVED':
+                ad_set_params["bid_strategy"] = None
+                ad_set_params["rf_prediction_id"] = config.get('prediction_id')
+            else:
+                ad_set_params["bid_strategy"] = config.get('ad_set_bid_strategy', 'LOWEST_COST_WITHOUT_CAP')
+            
+            # Include bid_amount if bid_strategy is COST_CAP or LOWEST_COST_WITH_BID_CAP
+            if config.get('ad_set_bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP'] or config.get('bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']:
+                print(f"Including bid amount. Ad set bid strategy: {config.get('ad_set_bid_strategy')}, Bid strategy: {config.get('bid_strategy')}")
+                bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
+                ad_set_params["bid_amount"] = bid_amount_cents
+                print(f"Converted bid amount to cents: {bid_amount_cents}")
+
             # Set the ad set budget based on the ad_set_budget_optimization
             if config.get('ad_set_budget_optimization') == "DAILY_BUDGET":
                 ad_set_params["daily_budget"] = int(float(config['ad_set_budget_value']) * 100)  # Convert to cents
             elif config.get('ad_set_budget_optimization') == "LIFETIME_BUDGET":
                 ad_set_params["lifetime_budget"] = int(float(config['ad_set_budget_value']) * 100)  # Convert to cents
+                # Set end_time as a datetime object
+                end_time = config.get('ad_set_end_time')
+                if end_time:
+                    if len(end_time) == 16:
+                        end_time += ":00"
+                    end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
+                    ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
         else:
-            ad_set_params["bid_strategy"] = None
-            ad_set_params["daily_budget"] = None
-            ad_set_params["lifetime_budget"] = None
+            # Set end_time if campaign_budget_optimization is "LIFETIME_BUDGET"
+            if config.get('campaign_budget_optimization') == "LIFETIME_BUDGET":
+                end_time = config.get('ad_set_end_time')
+                if end_time:
+                    if len(end_time) == 16:
+                        end_time += ":00"
+                    end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
+                    ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
 
+        print("Ad set parameters before creation:", ad_set_params)
         ad_set = AdAccount(config['ad_account_id']).create_ad_set(
             fields=[AdSet.Field.name],
             params=ad_set_params,
@@ -142,7 +174,8 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
     except Exception as e:
         print(f"Error creating ad set: {e}")
         return None
-        
+
+
 def upload_video(video_file, task_id, config):
     check_cancellation(task_id)
     try:
@@ -484,9 +517,10 @@ def handle_create_campaign():
     objective = request.form.get('objective', 'OUTCOME_SALES')
     campaign_budget_optimization = request.form.get('campaign_budget_optimization', 'DAILY_BUDGET')
     budget_value = request.form.get('campaign_budget_value', '50.73')
-    bid_strategy = request.form.get('bid_strategy', 'LOWEST_COST_WITHOUT_CAP')
+    bid_strategy = request.form.get('campaign_bid_strategy', 'LOWEST_COST_WITHOUT_CAP')
     buying_type = request.form.get('buying_type', 'AUCTION')
     object_store_url = request.form.get('object_store_url', '')
+    bid_amount = request.form.get('bid_amount', '0.0')
 
     with tasks_lock:
         upload_tasks[task_id] = True
@@ -528,7 +562,10 @@ def handle_create_campaign():
         'ad_set_budget_value': request.form.get('ad_set_budget_value', '50.73'),
         'ad_set_bid_strategy': request.form.get('ad_set_bid_strategy', 'LOWEST_COST_WITHOUT_CAP'),
         'campaign_budget_optimization': request.form.get('campaign_budget_optimization', 'AD_SET_BUDGET_OPTIMIZATION'),
-        'ad_format': ad_format
+        'ad_format': ad_format,
+        'bid_amount': bid_amount, # Added bid_amount to the config
+        'ad_set_end_time': request.form.get('ad_set_end_time', ''),
+        'buying_type': request.form.get('buying_type', 'AUCTION')
     }
 
     temp_dir = tempfile.mkdtemp()
@@ -683,4 +720,4 @@ def cancel_task():
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
+    socketio.run(app, debug=True, host='0.0.0.0')
