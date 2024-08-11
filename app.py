@@ -720,4 +720,4 @@ def cancel_task():
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    socketio.run(app, debug=True, host='0.0.0.0')
+    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
