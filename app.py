@@ -1,6 +1,7 @@
 import logging
 import time
 import eventlet
+import json
 
 # Now monkey-patch with eventlet
 eventlet.monkey_patch()
@@ -70,35 +71,66 @@ def create_campaign(name, objective, campaign_budget_optimization, budget_value,
 def create_ad_set(campaign_id, folder_name, videos, config, task_id):
     check_cancellation(task_id)
     try:
-        # Print the app_events value for debugging
         app_events = config.get('app_events')
         gender = config.get("gender", "All")
-        print(f"Received gender: {gender}")
-        print(f"Received app_events value: {app_events}")
-
-        # Check if app_events has seconds, if not, append ":00"
         if len(app_events) == 16:
             app_events += ":00"
-
-        # Set start_time to app_events if provided, otherwise use default time
         start_time = datetime.strptime(app_events, '%Y-%m-%dT%H:%M:%S') if app_events else (datetime.now() + timedelta(days=1)).replace(
             hour=4, minute=0, second=0, microsecond=0
         )
 
-        # Ensure the gender value is set properly
-        gender = config.get("gender", "All")
-        if gender == "Male":
-            print(gender)
-            gender_value = [1]
-        elif gender == "Female":
-            print(gender)
-            gender_value = [2]
-        else:
-            gender_value = [1, 2]
+        gender_value = [1, 2] if gender == "All" else [1] if gender == "Male" else [2]
 
-        ad_set_name = folder_name
+        publisher_platforms = []
+        facebook_positions = []
+        instagram_positions = []
+        messenger_positions = []
+        audience_network_positions = []
+
+        # Assign placements based on platform selections
+        if config['platforms'].get('facebook'):
+            publisher_platforms.append('facebook')
+            if config['placements'].get('feeds'):
+                facebook_positions.extend([
+                    'feed', 
+                    'profile_feed', 
+                    'marketplace', 
+                    'video_feeds', 
+                    'right_hand_column', 
+                    'business_explore'
+                ])
+            if config['placements'].get('stories'):
+                facebook_positions.extend(['story', 'facebook_reels'])
+            if config['placements'].get('instream_video'):
+                facebook_positions.extend(['instream_video', 'ads_on_facebook_reels'])
+            if config['placements'].get('search'):
+                facebook_positions.append('search')
+        
+        if config['platforms'].get('instagram'):
+            publisher_platforms.append('instagram')
+            if config['placements'].get('feeds'):
+                instagram_positions.extend(['stream', 'profile_feed'])
+            if config['placements'].get('stories'):
+                instagram_positions.extend(['story', 'reels'])
+            if config['placements'].get('explore'):
+                instagram_positions.extend(['explore', 'explore_home'])
+            if config['placements'].get('search'):
+                instagram_positions.append('ig_search')
+        
+        if config['platforms'].get('messenger'):
+            publisher_platforms.append('messenger')
+            if config['placements'].get('stories'):
+                messenger_positions.append('story')
+            if config['placements'].get('messages'):
+                messenger_positions.extend(['messenger_home', 'sponsored_messages'])
+
+        if config['platforms'].get('audience_network'):
+            publisher_platforms.append('audience_network')
+            if config['placements'].get('apps_sites'):
+                audience_network_positions.extend(['classic', 'rewarded_video'])
+
         ad_set_params = {
-            "name": ad_set_name,
+            "name": folder_name,
             "campaign_id": campaign_id,
             "billing_event": "IMPRESSIONS",
             "optimization_goal": "OFFSITE_CONVERSIONS",
@@ -107,8 +139,11 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
                 "age_min": int(config["age_range_min"]),
                 "age_max": int(config["age_range_max"]),
                 "genders": gender_value,
-                "publisher_platforms": ["facebook"],
-                "facebook_positions": ["feed", "profile_feed", "video_feeds"]
+                "publisher_platforms": publisher_platforms,
+                "facebook_positions": facebook_positions if facebook_positions else None,
+                "instagram_positions": instagram_positions if instagram_positions else None,
+                "messenger_positions": messenger_positions if messenger_positions else None,
+                "audience_network_positions": audience_network_positions if audience_network_positions else None
             },
             "start_time": start_time.strftime('%Y-%m-%dT%H:%M:%S'),
             "dynamic_ad_image_enhancement": False,
@@ -120,34 +155,27 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             }
         }
 
-        # Include bid_amount if bid_strategy is COST_CAP or LOWEST_COST_WITH_BID_CAP
+        ad_set_params = {k: v for k, v in ad_set_params.items() if v is not None}
+
         if config.get('ad_set_bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP'] or config.get('bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']:
-            print(f"Including bid amount. Ad set bid strategy: {config.get('ad_set_bid_strategy')}, Bid strategy: {config.get('bid_strategy')}")
-            bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
+            bid_amount_cents = int(float(config['bid_amount']) * 100)
             ad_set_params["bid_amount"] = bid_amount_cents
-            print(f"Converted bid amount to cents: {bid_amount_cents}")
 
         if config.get('campaign_budget_optimization') == 'AD_SET_BUDGET_OPTIMIZATION':
-            # Set bid_strategy to None if buying type is RESERVED
             if config.get('buying_type') == 'RESERVED':
                 ad_set_params["bid_strategy"] = None
                 ad_set_params["rf_prediction_id"] = config.get('prediction_id')
             else:
                 ad_set_params["bid_strategy"] = config.get('ad_set_bid_strategy', 'LOWEST_COST_WITHOUT_CAP')
             
-            # Include bid_amount if bid_strategy is COST_CAP or LOWEST_COST_WITH_BID_CAP
             if config.get('ad_set_bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP'] or config.get('bid_strategy') in ['COST_CAP', 'LOWEST_COST_WITH_BID_CAP']:
-                print(f"Including bid amount. Ad set bid strategy: {config.get('ad_set_bid_strategy')}, Bid strategy: {config.get('bid_strategy')}")
-                bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
+                bid_amount_cents = int(float(config['bid_amount']) * 100)
                 ad_set_params["bid_amount"] = bid_amount_cents
-                print(f"Converted bid amount to cents: {bid_amount_cents}")
 
-            # Set the ad set budget based on the ad_set_budget_optimization
             if config.get('ad_set_budget_optimization') == "DAILY_BUDGET":
-                ad_set_params["daily_budget"] = int(float(config['ad_set_budget_value']) * 100)  # Convert to cents
+                ad_set_params["daily_budget"] = int(float(config['ad_set_budget_value']) * 100)
             elif config.get('ad_set_budget_optimization') == "LIFETIME_BUDGET":
-                ad_set_params["lifetime_budget"] = int(float(config['ad_set_budget_value']) * 100)  # Convert to cents
-                # Set end_time as a datetime object
+                ad_set_params["lifetime_budget"] = int(float(config['ad_set_budget_value']) * 100)
                 end_time = config.get('ad_set_end_time')
                 if end_time:
                     if len(end_time) == 16:
@@ -155,7 +183,6 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
                     end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
                     ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
         else:
-            # Set end_time if campaign_budget_optimization is "LIFETIME_BUDGET"
             if config.get('campaign_budget_optimization') == "LIFETIME_BUDGET":
                 end_time = config.get('ad_set_end_time')
                 if end_time:
@@ -164,17 +191,13 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
                     end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
                     ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
 
-        print("Ad set parameters before creation:", ad_set_params)
         ad_set = AdAccount(config['ad_account_id']).create_ad_set(
             fields=[AdSet.Field.name],
             params=ad_set_params,
         )
-        print(f"Created ad set with ID: {ad_set.get_id()}")
         return ad_set
     except Exception as e:
-        print(f"Error creating ad set: {e}")
         return None
-
 
 def upload_video(video_file, task_id, config):
     check_cancellation(task_id)
@@ -522,6 +545,24 @@ def handle_create_campaign():
     object_store_url = request.form.get('object_store_url', '')
     bid_amount = request.form.get('bid_amount', '0.0')
 
+    platforms_str = request.form.get('platforms', '{}')
+    placements_str = request.form.get('placements', '{}')
+
+    try:
+        platforms = json.loads(platforms_str)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding platforms JSON: {e}")
+        platforms = {}
+
+    try:
+        placements = json.loads(placements_str)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding placements JSON: {e}")
+        placements = {}
+
+    print(platforms)
+    print(placements)
+
     with tasks_lock:
         upload_tasks[task_id] = True
         process_pids[task_id] = []
@@ -563,9 +604,11 @@ def handle_create_campaign():
         'ad_set_bid_strategy': request.form.get('ad_set_bid_strategy', 'LOWEST_COST_WITHOUT_CAP'),
         'campaign_budget_optimization': request.form.get('campaign_budget_optimization', 'AD_SET_BUDGET_OPTIMIZATION'),
         'ad_format': ad_format,
-        'bid_amount': bid_amount, # Added bid_amount to the config
+        'bid_amount': bid_amount, 
         'ad_set_end_time': request.form.get('ad_set_end_time', ''),
-        'buying_type': request.form.get('buying_type', 'AUCTION')
+        'buying_type': request.form.get('buying_type', 'AUCTION'),
+        'platforms': platforms,  # Include platforms in config
+        'placements': placements  # Include placements in config
     }
 
     temp_dir = tempfile.mkdtemp()
@@ -695,6 +738,7 @@ def handle_create_campaign():
 
     return jsonify({"message": "Campaign processing started", "task_id": task_id})
 
+
 @app.route('/cancel_task', methods=['POST'])
 def cancel_task():
     try:
@@ -720,4 +764,4 @@ def cancel_task():
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    socketio.run(app, debug=True, host='0.0.0.0', port=5001)
+    socketio.run(app, debug=True, host='0.0.0.0',port=5001)
