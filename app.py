@@ -219,8 +219,44 @@ def upload_video(video_file, task_id, config):
         video = AdVideo(parent_id=config['ad_account_id'])
         video[AdVideo.Field.filepath] = video_file
         video.remote_create()
-        print(f"Uploaded video with ID: {video.get_id()}")
-        return video.get_id()
+        video_id = video.get_id()
+
+        # Retry logic to ensure the video is ready
+        max_retries = 10
+        retries = 0
+        while retries < max_retries:
+            try:
+                ready_video = AdVideo(fbid=video_id).api_get(fields=['status'])
+                
+                # Extract the relevant statuses
+                video_status = ready_video.get('status', {}).get('video_status', 'unknown')
+                processing_status = ready_video.get('status', {}).get('processing_phase', {}).get('status', 'unknown')
+                publishing_status = ready_video.get('status', {}).get('publishing_phase', {}).get('status', 'unknown')
+                uploading_status = ready_video.get('status', {}).get('uploading_phase', {}).get('status', 'unknown')
+
+                # Print the statuses on every retry
+                print(f"Retry {retries + 1}/{max_retries}")
+                print(f"Video Status: {video_status}")
+                print(f"Processing Phase Status: {processing_status}")
+                print(f"Publishing Phase Status: {publishing_status}")
+                print(f"Uploading Phase Status: {uploading_status}\n")
+
+                if video_status == 'ready':
+                    print(f"Video {video_id} is ready for use.")
+                    break
+            except Exception as retry_error:
+                print(f"Error during retry {retries + 1}: {retry_error}")
+                
+            # Wait 10 seconds before retrying
+            time.sleep(10)
+            retries += 1
+
+        if retries == max_retries:
+            print(f"Video {video_id} was not ready after {max_retries} retries.")
+            return None
+
+        print(f"Uploaded video with ID: {video_id}")
+        return video_id
     except Exception as e:
         print(f"Error uploading video: {e}")
         return None
@@ -340,87 +376,141 @@ def parse_config(config_text):
         config[key.strip()] = value.strip()
     return config
 
-def create_ad(ad_set_id, video_file, config, task_id):
+def create_ad(ad_set_id, media_file, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Single image or video')
         if ad_format == 'Single image or video':
-            
-            video_path = video_file
-            thumbnail_path = f"{os.path.splitext(video_file)[0]}.jpg"
-            
-            generate_thumbnail(video_path, thumbnail_path, task_id)
-            image_hash = upload_image(thumbnail_path, task_id, config)
-            
-            if not image_hash:
-                print(f"Failed to upload thumbnail: {thumbnail_path}")
-                return
+            if media_file.lower().endswith(('.jpg', '.png', '.jpeg')):
+                print("Images")
+                # Image ad logic
+                image_hash = upload_image(media_file, task_id, config)
+                if not image_hash:
+                    print(f"Failed to upload image: {media_file}")
+                    return
+                
+                base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
+                utm_parameters = config.get('url_parameters', 'utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
 
-            max_duration = 240 * 60  # 240 minutes
-            video_duration = get_video_duration(video_path, task_id)
-            if video_duration > max_duration:
-                trimmed_video_path = f"./trimmed_{os.path.basename(video_file)}"
-                trim_video(video_path, trimmed_video_path, max_duration, task_id)
-                video_path = trimmed_video_path
+                if utm_parameters and not utm_parameters.startswith('?'):
+                    utm_parameters = '?' + utm_parameters
+                
+                link = base_link + utm_parameters
 
-            video_id = upload_video(video_path, task_id, config)
-            if not video_id:
-                print(f"Failed to upload video: {video_file}")
-                return
-            
-            base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
-            utm_parameters = config.get('url_parameters', 'utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
-            
-            # Ensure UTM parameters start with ? if utm_parameters is not empty
-            if utm_parameters != "" and not utm_parameters.startswith('?'):
-                utm_parameters = '?' + utm_parameters
-            
-            link = base_link + utm_parameters
+                call_to_action_type = config.get('call_to_action', 'SHOP_NOW')
 
-            call_to_action_type = config.get('call_to_action', 'SHOP_NOW')  # Default to "SHOP_NOW" if not provided
-
-            object_story_spec = {
-                "page_id": config.get('facebook_page_id', '102076431877514'),
-                "video_data": {
-                    "video_id": video_id,
-                    "call_to_action": {
-                        "type": call_to_action_type,
-                        "value": {
-                            "link": link
+                object_story_spec = {
+                    "page_id": config.get('facebook_page_id', '102076431877514'),
+                    "link_data": {
+                        "image_hash": image_hash,
+                        "link": link,
+                        "message": config.get('ad_creative_primary_text', 'default text'),
+                        "caption": config.get('ad_creative_headline', 'No More Neuropathic Foot Pain'),
+                        "call_to_action": {
+                            "type": call_to_action_type,
+                            "value": {
+                                "link": link
+                            }
                         }
-                    },
-                    "message": config.get('ad_creative_primary_text', 'default text'),
-                    "title": config.get('ad_creative_headline', 'No More Neuropathic Foot Pain'),
-                    "image_hash": image_hash,
-                    "link_description": config.get('ad_creative_description', 'FREE Shipping & 60-Day Money-Back Guarantee')
-                }
-            }
-            degrees_of_freedom_spec = {
-                "creative_features_spec": {
-                    "standard_enhancements": {
-                        "enroll_status": "OPT_OUT"
                     }
                 }
-            }
-            ad_creative = AdCreative(parent_id=config['ad_account_id'])
-            params = {
-                AdCreative.Field.name: "Creative Name",
-                AdCreative.Field.object_story_spec: object_story_spec,
-                AdCreative.Field.degrees_of_freedom_spec: degrees_of_freedom_spec
-            }
-            ad_creative.update(params)
-            ad_creative.remote_create()
 
-            ad = Ad(parent_id=config['ad_account_id'])
-            ad[Ad.Field.name] = os.path.splitext(os.path.basename(video_file))[0]
-            ad[Ad.Field.adset_id] = ad_set_id
-            ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
-            ad[Ad.Field.status] = "PAUSED"
-            ad.remote_create()
-            
-            os.remove(thumbnail_path)
-            
-            print(f"Created ad with ID: {ad.get_id()}")
+                degrees_of_freedom_spec = {
+                    "creative_features_spec": {
+                        "standard_enhancements": {
+                            "enroll_status": "OPT_OUT"  # explicitly opting out
+                        }
+                    }
+                }
+
+                ad_creative = AdCreative(parent_id=config['ad_account_id'])
+                params = {
+                    AdCreative.Field.name: "Creative Name",
+                    AdCreative.Field.object_story_spec: object_story_spec,
+                    AdCreative.Field.degrees_of_freedom_spec: degrees_of_freedom_spec
+                }
+                ad_creative.update(params)
+                ad_creative.remote_create()
+
+                ad = Ad(parent_id=config['ad_account_id'])
+                ad[Ad.Field.name] = os.path.splitext(os.path.basename(media_file))[0]
+                ad[Ad.Field.adset_id] = ad_set_id
+                ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
+                ad[Ad.Field.status] = "PAUSED"
+                ad.remote_create()
+
+                print(f"Created image ad with ID: {ad.get_id()}")
+
+            else:
+                # Video ad logic
+                video_path = media_file
+                thumbnail_path = f"{os.path.splitext(media_file)[0]}.jpg"
+
+                generate_thumbnail(video_path, thumbnail_path, task_id)
+                image_hash = upload_image(thumbnail_path, task_id, config)
+
+                if not image_hash:
+                    print(f"Failed to upload thumbnail: {thumbnail_path}")
+                    return
+
+                video_id = upload_video(video_path, task_id, config)
+                if not video_id:
+                    print(f"Failed to upload video: {media_file}")
+                    return
+
+                base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
+                utm_parameters = config.get('url_parameters', 'utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
+
+                if utm_parameters and not utm_parameters.startswith('?'):
+                    utm_parameters = '?' + utm_parameters
+
+                link = base_link + utm_parameters
+
+                call_to_action_type = config.get('call_to_action', 'SHOP_NOW')
+
+                object_story_spec = {
+                    "page_id": config.get('facebook_page_id', '102076431877514'),
+                    "video_data": {
+                        "video_id": video_id,
+                        "call_to_action": {
+                            "type": call_to_action_type,
+                            "value": {
+                                "link": link
+                            }
+                        },
+                        "message": config.get('ad_creative_primary_text', 'default text'),
+                        "title": config.get('ad_creative_headline', 'No More Neuropathic Foot Pain'),
+                        "image_hash": image_hash,
+                        "link_description": config.get('ad_creative_description', 'FREE Shipping & 60-Day Money-Back Guarantee')
+                    }
+                }
+
+                degrees_of_freedom_spec = {
+                    "creative_features_spec": {
+                        "standard_enhancements": {
+                            "enroll_status": "OPT_OUT"  # explicitly opting out
+                        }
+                    }
+                }
+
+                ad_creative = AdCreative(parent_id=config['ad_account_id'])
+                params = {
+                    AdCreative.Field.name: "Creative Name",
+                    AdCreative.Field.object_story_spec: object_story_spec,
+                    AdCreative.Field.degrees_of_freedom_spec: degrees_of_freedom_spec
+                }
+                ad_creative.update(params)
+                ad_creative.remote_create()
+
+                ad = Ad(parent_id=config['ad_account_id'])
+                ad[Ad.Field.name] = os.path.splitext(os.path.basename(media_file))[0]
+                ad[Ad.Field.adset_id] = ad_set_id
+                ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
+                ad[Ad.Field.status] = "PAUSED"
+                ad.remote_create()
+
+                print(f"Created video ad with ID: {ad.get_id()}")
+
     except TaskCanceledException:
         print(f"Task {task_id} has been canceled during ad creation.")
     except Exception as e:
@@ -455,12 +545,11 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
 
                 base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
                 utm_parameters = config.get('url_parameters', 'utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
-                
-               # Ensure UTM parameters start with ? if utm_parameters is not empty
+
+                # Ensure UTM parameters start with ? if utm_parameters is not empty
                 if utm_parameters != "" and not utm_parameters.startswith('?'):
                     utm_parameters = '?' + utm_parameters
 
-                
                 link = base_link + utm_parameters
 
                 call_to_action_type = config.get('call_to_action', 'SHOP_NOW')  # Default to "SHOP_NOW" if not provided
@@ -492,10 +581,19 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
                 }
             }
 
+            degrees_of_freedom_spec = {
+                "creative_features_spec": {
+                    "standard_enhancements": {
+                        "enroll_status": "OPT_OUT"  # explicitly opting out
+                    }
+                }
+            }
+
             ad_creative = AdCreative(parent_id=config['ad_account_id'])
             params = {
                 AdCreative.Field.name: "Carousel Ad Creative",
-                AdCreative.Field.object_story_spec: object_story_spec
+                AdCreative.Field.object_story_spec: object_story_spec,
+                AdCreative.Field.degrees_of_freedom_spec: degrees_of_freedom_spec
             }
             ad_creative.update(params)
             ad_creative.remote_create()
@@ -546,6 +644,14 @@ def get_all_video_files(directory):
             if file.lower().endswith(('.mp4', '.mov', '.avi')):
                 video_files.append(os.path.join(root, file))
     return video_files
+
+def get_all_image_files(directory):
+    image_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                image_files.append(os.path.join(root, file))
+    return image_files
 
 @app.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
@@ -667,9 +773,11 @@ def handle_create_campaign():
             return False
 
         total_videos = 0
+        total_images = 0
         for folder in folders:
             folder_path = os.path.join(temp_dir, folder)
             total_videos += len(get_all_video_files(folder_path))
+            total_images += len(get_all_image_files(folder_path))
 
         def process_videos(task_id, campaign_id, folders, config, total_videos):
             try:
@@ -769,7 +877,102 @@ def handle_create_campaign():
                     process_pids.pop(task_id, None)
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-        socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
+        def process_images(task_id, campaign_id, folders, config, total_images):
+            try:
+                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_images}"})
+                processed_images = 0
+
+                with tqdm(total=total_images, desc="Processing images") as pbar:
+                    last_update_time = time.time()
+                    for folder in folders:
+                        check_cancellation(task_id)
+                        folder_path = os.path.join(temp_dir, folder)
+
+                        if has_subfolders(folder_path):
+                            for subfolder in os.listdir(folder_path):
+                                subfolder_path = os.path.join(folder_path, subfolder)
+                                if os.path.isdir(subfolder_path):
+                                    image_files = get_all_image_files(subfolder_path)
+                                    if not image_files:
+                                        continue
+
+                                    ad_set = create_ad_set(campaign_id, subfolder, image_files, config, task_id)
+                                    if not ad_set:
+                                        continue
+
+                                    with ThreadPoolExecutor(max_workers=5) as executor:
+                                        future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+
+                                        for future in as_completed(future_to_image):
+                                            check_cancellation(task_id)
+                                            image = future_to_image[future]
+                                            try:
+                                                future.result()
+                                            except TaskCanceledException:
+                                                logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                                return
+                                            except Exception as e:
+                                                logging.error(f"Error processing image {image}: {e}")
+                                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                            finally:
+                                                processed_images += 1
+                                                pbar.update(1)
+
+                                                current_time = time.time()
+                                                if current_time - last_update_time >= 1:
+                                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                                    last_update_time = current_time
+
+                        else:
+                            image_files = get_all_image_files(folder_path)
+                            if not image_files:
+                                continue
+
+                            ad_set = create_ad_set(campaign_id, folder, image_files, config, task_id)
+                            if not ad_set:
+                                continue
+
+                            with ThreadPoolExecutor(max_workers=5) as executor:
+                                future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+
+                                for future in as_completed(future_to_image):
+                                    check_cancellation(task_id)
+                                    image = future_to_image[future]
+                                    try:
+                                        future.result()
+                                    except TaskCanceledException:
+                                        logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                        return
+                                    except Exception as e:
+                                        logging.error(f"Error processing image {image}: {e}")
+                                        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                    finally:
+                                        processed_images += 1
+                                        pbar.update(1)
+
+                                        current_time = time.time()
+                                        if current_time - last_update_time >= 0.5:
+                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                            last_update_time = current_time
+
+                socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_images}/{total_images}"})
+                socketio.emit('task_complete', {'task_id': task_id})
+            except TaskCanceledException:
+                logging.warning(f"Task {task_id} has been canceled during image processing.")
+            except Exception as e:
+                logging.error(f"Error in processing images: {e}")
+                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            finally:
+                with tasks_lock:
+                    process_pids.pop(task_id, None)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # Decide whether to process videos or images or both
+        if total_videos > 0:
+            socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
+        
+        if total_images > 0:
+            socketio.start_background_task(target=process_images, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_images=total_images)
 
         return jsonify({"message": "Campaign processing started", "task_id": task_id})
 
