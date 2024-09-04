@@ -26,6 +26,7 @@ from threading import Lock
 import signal
 from tqdm import tqdm
 from datetime import datetime, timedelta, timezone
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
@@ -143,7 +144,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             "name": folder_name,
             "campaign_id": campaign_id,
             "billing_event": "IMPRESSIONS",
-            "optimization_goal": "OFFSITE_CONVERSIONS",
+            "optimization_goal": config.get("optimization_goal", "OFFSITE_CONVERSIONS"),  # Use the optimization goal from config
             "targeting": {
                 "geo_locations": {"countries": [config["location"]]},
                 "age_min": int(config["age_range_min"]),
@@ -160,7 +161,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             "dynamic_ad_voice_enhancement": False,
             "promoted_object": {
                 "pixel_id": config["pixel_id"],
-                "custom_event_type": "PURCHASE",
+                "custom_event_type": config.get("event_type", "PURCHASE"),  # Use event type from config with default "PURCHASE"
                 "object_store_url": config["object_store_url"] if config["objective"] == "OUTCOME_APP_PROMOTION" else None
             }
         }
@@ -376,11 +377,21 @@ def parse_config(config_text):
         config[key.strip()] = value.strip()
     return config
 
+def convert_webp_to_jpeg(webp_file):
+    jpeg_file = os.path.splitext(webp_file)[0] + ".jpg"
+    with Image.open(webp_file) as img:
+        img.convert("RGB").save(jpeg_file, "JPEG")
+    return jpeg_file
+
 def create_ad(ad_set_id, media_file, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Single image or video')
         if ad_format == 'Single image or video':
+            if media_file.lower().endswith('.webp'):
+                print("Converting webp to jpeg")
+                media_file = convert_webp_to_jpeg(media_file)
+
             if media_file.lower().endswith(('.jpg', '.png', '.jpeg')):
                 print("Images")
                 # Image ad logic
@@ -403,9 +414,10 @@ def create_ad(ad_set_id, media_file, config, task_id):
                     "page_id": config.get('facebook_page_id', '102076431877514'),
                     "link_data": {
                         "image_hash": image_hash,
-                        "link": link,
+                        "link": link,  # This is the link to your website or product page
                         "message": config.get('ad_creative_primary_text', 'default text'),
-                        "caption": config.get('ad_creative_headline', 'No More Neuropathic Foot Pain'),
+                        "name": config.get('ad_creative_headline', 'Your Headline Here'),
+                        "description": config.get('ad_creative_description', 'Your Description Here'),
                         "call_to_action": {
                             "type": call_to_action_type,
                             "value": {
@@ -414,7 +426,7 @@ def create_ad(ad_set_id, media_file, config, task_id):
                         }
                     }
                 }
-
+                                
                 degrees_of_freedom_spec = {
                     "creative_features_spec": {
                         "standard_enhancements": {
@@ -528,50 +540,73 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
             carousel_cards = []
 
             for media_file in media_files:
-                video_path = media_file
-                thumbnail_path = f"{os.path.splitext(media_file)[0]}.jpg"
+                if media_file.lower().endswith('.webp'):
+                    print("Converting webp to jpeg")
+                    media_file = convert_webp_to_jpeg(media_file)
 
-                generate_thumbnail(video_path, thumbnail_path, task_id)
-                image_hash = upload_image(thumbnail_path, task_id, config)
+                if media_file.lower().endswith(('.mp4', '.mov', '.avi')):
+                    # Video processing
+                    video_path = media_file
+                    thumbnail_path = f"{os.path.splitext(media_file)[0]}.jpg"
 
-                if not image_hash:
-                    print(f"Failed to upload thumbnail: {thumbnail_path}")
-                    return
+                    generate_thumbnail(video_path, thumbnail_path, task_id)
+                    image_hash = upload_image(thumbnail_path, task_id, config)
 
-                video_id = upload_video(video_path, task_id, config)
-                if not video_id:
-                    print(f"Failed to upload video: {media_file}")
-                    return
+                    if not image_hash:
+                        print(f"Failed to upload thumbnail: {thumbnail_path}")
+                        return
 
-                base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
+                    video_id = upload_video(video_path, task_id, config)
+                    if not video_id:
+                        print(f"Failed to upload video: {media_file}")
+                        return
+
+                    card = {
+                        "link": config.get('link', 'https://kyronaclinic.com/pages/review-1'),
+                        "video_id": video_id,
+                        "call_to_action": {
+                            "type": config.get('call_to_action', 'SHOP_NOW'),  # Default to "SHOP_NOW" if not provided
+                            "value": {
+                                "link": config.get('link', 'https://kyronaclinic.com/pages/review-1')
+                            }
+                        },
+                        "image_hash": image_hash
+                    }
+
+                elif media_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    # Image processing
+                    image_hash = upload_image(media_file, task_id, config)
+                    if not image_hash:
+                        print(f"Failed to upload image: {media_file}")
+                        return
+
+                    card = {
+                        "link": config.get('link', 'https://kyronaclinic.com/pages/review-1'),
+                        "image_hash": image_hash,
+                        "call_to_action": {
+                            "type": config.get('call_to_action', 'SHOP_NOW'),  # Default to "SHOP_NOW" if not provided
+                            "value": {
+                                "link": config.get('link', 'https://kyronaclinic.com/pages/review-1')
+                            }
+                        }
+                    }
+
+                else:
+                    print(f"Unsupported media file format: {media_file}")
+                    continue
+
+                # Add UTM parameters if provided
                 utm_parameters = config.get('url_parameters', 'utm_source=Facebook&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}')
-
-                # Ensure UTM parameters start with ? if utm_parameters is not empty
-                if utm_parameters != "" and not utm_parameters.startswith('?'):
+                if utm_parameters and not utm_parameters.startswith('?'):
                     utm_parameters = '?' + utm_parameters
 
-                link = base_link + utm_parameters
-
-                call_to_action_type = config.get('call_to_action', 'SHOP_NOW')  # Default to "SHOP_NOW" if not provided
-
-                card = {
-                    "link": link,
-                    "video_id": video_id,
-                    "call_to_action": {
-                        "type": call_to_action_type,
-                        "value": {
-                            "link": link
-                        }
-                    },
-                    "image_hash": image_hash
-                }
-
+                card['link'] += utm_parameters
                 carousel_cards.append(card)
 
             object_story_spec = {
                 "page_id": config.get('facebook_page_id', '102076431877514'),
                 "link_data": {
-                    "link": base_link,
+                    "link": config.get('link', 'https://kyronaclinic.com/pages/review-1'),
                     "child_attachments": carousel_cards,
                     "multi_share_optimized": True,
                     "multi_share_end_card": False,
@@ -649,7 +684,7 @@ def get_all_image_files(directory):
     image_files = []
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 image_files.append(os.path.join(root, file))
     return image_files
 
@@ -658,6 +693,8 @@ def handle_create_campaign():
     try:
         campaign_name = request.form.get('campaign_name')
         campaign_id = request.form.get('campaign_id')
+        print("campaign id:")
+        print(campaign_id)
         upload_folder = request.files.getlist('uploadFolders')
         task_id = request.form.get('task_id')
 
@@ -672,7 +709,6 @@ def handle_create_campaign():
         print(access_token)
         print(app_id)
         print(ad_account_id)
-
         objective = request.form.get('objective', 'OUTCOME_SALES')
         campaign_budget_optimization = request.form.get('campaign_budget_optimization', 'DAILY_BUDGET')
         budget_value = request.form.get('campaign_budget_value', '50.73')
@@ -713,15 +749,20 @@ def handle_create_campaign():
         if campaign_id:
             campaign_id = find_campaign_by_id(campaign_id, ad_account_id)
             if not campaign_id:
+                print("hello")
                 logging.error(f"Campaign ID {campaign_id} not found for ad account {ad_account_id}")
+                print(campaign_id)
+                print(ad_account_id)
                 return jsonify({"error": "Campaign ID not found"}), 404
         else:
+            print(objective)
+            print("Objective")
             campaign_id, campaign = create_campaign(campaign_name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token)
             if not campaign_id:
                 logging.error(f"Failed to create campaign with name {campaign_name}")
                 return jsonify({"error": "Failed to create campaign"}), 500
 
-        config = {
+            config = {
             'ad_account_id': ad_account_id,
             'facebook_page_id': facebook_page_id,
             'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
@@ -753,7 +794,12 @@ def handle_create_campaign():
             'ad_set_end_time': request.form.get('ad_set_end_time', ''),
             'buying_type': request.form.get('buying_type', 'AUCTION'),
             'platforms': platforms,
-            'placements': placements
+            'placements': placements,
+            'flexible_spec': request.form.get('flexible_spec', []),
+            'geo_locations': request.form.get('geo_locations'),
+            'custom_audiences': request.form.get('custom_audiences', []),
+            'optimization_goal': request.form.get('performance_goal', 'OFFSITE_CONVERSIONS'),
+            'event_type': request.form.get('event_type', 'PURCHASE'),
         }
 
         temp_dir = tempfile.mkdtemp()
@@ -900,28 +946,32 @@ def handle_create_campaign():
                                     if not ad_set:
                                         continue
 
-                                    with ThreadPoolExecutor(max_workers=5) as executor:
-                                        future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+                                    if config['ad_format'] == 'Single image or video':
+                                        with ThreadPoolExecutor(max_workers=5) as executor:
+                                            future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
 
-                                        for future in as_completed(future_to_image):
-                                            check_cancellation(task_id)
-                                            image = future_to_image[future]
-                                            try:
-                                                future.result()
-                                            except TaskCanceledException:
-                                                logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
-                                                return
-                                            except Exception as e:
-                                                logging.error(f"Error processing image {image}: {e}")
-                                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
-                                            finally:
-                                                processed_images += 1
-                                                pbar.update(1)
+                                            for future in as_completed(future_to_image):
+                                                check_cancellation(task_id)
+                                                image = future_to_image[future]
+                                                try:
+                                                    future.result()
+                                                except TaskCanceledException:
+                                                    logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                                    return
+                                                except Exception as e:
+                                                    logging.error(f"Error processing image {image}: {e}")
+                                                    socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                                finally:
+                                                    processed_images += 1
+                                                    pbar.update(1)
 
-                                                current_time = time.time()
-                                                if current_time - last_update_time >= 1:
-                                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
-                                                    last_update_time = current_time
+                                                    current_time = time.time()
+                                                    if current_time - last_update_time >= 1:
+                                                        socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                                        last_update_time = current_time
+
+                                    elif config['ad_format'] == 'Carousel':
+                                        create_carousel_ad(ad_set.get_id(), image_files, config, task_id)
 
                         else:
                             image_files = get_all_image_files(folder_path)
@@ -932,28 +982,32 @@ def handle_create_campaign():
                             if not ad_set:
                                 continue
 
-                            with ThreadPoolExecutor(max_workers=5) as executor:
-                                future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+                            if config['ad_format'] == 'Single image or video':
+                                with ThreadPoolExecutor(max_workers=5) as executor:
+                                    future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
 
-                                for future in as_completed(future_to_image):
-                                    check_cancellation(task_id)
-                                    image = future_to_image[future]
-                                    try:
-                                        future.result()
-                                    except TaskCanceledException:
-                                        logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
-                                        return
-                                    except Exception as e:
-                                        logging.error(f"Error processing image {image}: {e}")
-                                        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
-                                    finally:
-                                        processed_images += 1
-                                        pbar.update(1)
+                                    for future in as_completed(future_to_image):
+                                        check_cancellation(task_id)
+                                        image = future_to_image[future]
+                                        try:
+                                            future.result()
+                                        except TaskCanceledException:
+                                            logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                            return
+                                        except Exception as e:
+                                            logging.error(f"Error processing image {image}: {e}")
+                                            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                        finally:
+                                            processed_images += 1
+                                            pbar.update(1)
 
-                                        current_time = time.time()
-                                        if current_time - last_update_time >= 0.5:
-                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
-                                            last_update_time = current_time
+                                            current_time = time.time()
+                                            if current_time - last_update_time >= 0.5:
+                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                                last_update_time = current_time
+
+                            elif config['ad_format'] == 'Carousel':
+                                create_carousel_ad(ad_set.get_id(), image_files, config, task_id)
 
                 socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_images}/{total_images}"})
                 socketio.emit('task_complete', {'task_id': task_id})
@@ -967,11 +1021,74 @@ def handle_create_campaign():
                     process_pids.pop(task_id, None)
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-        # Decide whether to process videos or images or both
-        if total_videos > 0:
-            socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
         
-        if total_images > 0:
+        def process_mixed_media(task_id, campaign_id, folders, config, total_videos, total_images):
+            try:
+                total_files = total_videos + total_images
+                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_files}"})
+                processed_files = 0
+
+                with tqdm(total=total_files, desc="Processing mixed media") as pbar:
+                    last_update_time = time.time()
+                    for folder in folders:
+                        check_cancellation(task_id)
+                        folder_path = os.path.join(temp_dir, folder)
+
+                        video_files = get_all_video_files(folder_path)
+                        image_files = get_all_image_files(folder_path)
+                        media_files = video_files + image_files
+
+                        if media_files:
+                            ad_set = create_ad_set(campaign_id, folder, media_files, config, task_id)
+                            if not ad_set:
+                                continue
+
+                            if config['ad_format'] == 'Single image or video':
+                                with ThreadPoolExecutor(max_workers=5) as executor:
+                                    future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
+
+                                    for future in as_completed(future_to_media):
+                                        check_cancellation(task_id)
+                                        media = future_to_media[future]
+                                        try:
+                                            future.result()
+                                        except TaskCanceledException:
+                                            logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
+                                            return
+                                        except Exception as e:
+                                            logging.error(f"Error processing media {media}: {e}")
+                                            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                        finally:
+                                            processed_files += 1
+                                            pbar.update(1)
+
+                                            current_time = time.time()
+                                            if current_time - last_update_time >= 0.5:
+                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
+                                                last_update_time = current_time
+
+                            elif config['ad_format'] == 'Carousel':
+                                create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
+
+                socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_files}/{total_files}"})
+                socketio.emit('task_complete', {'task_id': task_id})
+            except TaskCanceledException:
+                logging.warning(f"Task {task_id} has been canceled during mixed media processing.")
+            except Exception as e:
+                logging.error(f"Error in processing mixed media: {e}")
+                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            finally:
+                with tasks_lock:
+                    process_pids.pop(task_id, None)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+        # Call the appropriate processing function based on media types
+        if total_videos > 0 and total_images > 0:
+            socketio.start_background_task(target=process_mixed_media, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos, total_images=total_images)
+        elif total_videos > 0:
+            socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
+        elif total_images > 0:
             socketio.start_background_task(target=process_images, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_images=total_images)
 
         return jsonify({"message": "Campaign processing started", "task_id": task_id})

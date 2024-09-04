@@ -7,3 +7,4 @@ facebook-business
 python-socketio
 eventlet
 asyncio
+Pillow
