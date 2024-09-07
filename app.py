@@ -1,20 +1,24 @@
 import logging
 import time
-import eventlet
 import json
-
-# Now monkey-patch with eventlet
-eventlet.monkey_patch()
-
-from flask import Flask, request, jsonify
-import shutil
-from flask_cors import CORS
-from flask_socketio import SocketIO, emit
 import os
+import shutil
 import tempfile
 import subprocess
+import signal
+from threading import Lock
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Patch eventlet to support asynchronous operations
+import eventlet
+eventlet.monkey_patch()
+
+# Flask-related imports
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+
+# Facebook Ads SDK
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adset import AdSet
@@ -22,11 +26,13 @@ from facebook_business.adobjects.adcreative import AdCreative
 from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
-from threading import Lock
-import signal
+
+# External libraries
 from tqdm import tqdm
-from datetime import datetime, timedelta, timezone
 from PIL import Image
+
+# Concurrency tools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -40,7 +46,8 @@ canceled_tasks = set()
 class TaskCanceledException(Exception):
     pass
 
-def create_campaign(name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token):
+def create_campaign(name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token, is_cbo):
+    print(is_cbo)
     check_cancellation(task_id)
     try:
         FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
@@ -54,9 +61,9 @@ def create_campaign(name, objective, campaign_budget_optimization, budget_value,
 
         if buying_type == "AUCTION":
             budget_value_cents = int(float(budget_value) * 100)  # Convert dollars to cents
-            campaign_params["daily_budget"] = budget_value_cents if campaign_budget_optimization == "DAILY_BUDGET" else None
-            campaign_params["lifetime_budget"] = budget_value_cents if campaign_budget_optimization == "LIFETIME_BUDGET" else None
-            campaign_params["bid_strategy"] = bid_strategy if campaign_budget_optimization != "AD_SET_BUDGET_OPTIMIZATION" else None
+            campaign_params["daily_budget"] = budget_value_cents if campaign_budget_optimization == "DAILY_BUDGET" and is_cbo else None
+            campaign_params["lifetime_budget"] = budget_value_cents if campaign_budget_optimization == "LIFETIME_BUDGET" and is_cbo else None
+            campaign_params["bid_strategy"] = bid_strategy if is_cbo else None
             
         campaign = AdAccount(ad_account_id).create_campaign(
             fields=[AdAccount.Field.id],
@@ -74,6 +81,18 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
     try:
         app_events = config.get('app_events')
         gender = config.get("gender", "All")
+        attribution_setting = config.get('attribution_setting', '7d_click')  # Default to '7d_click' if not provided
+        event_type = config.get('event_type', 'PURCHASE')  # Default to 'PURCHASE' if not provided
+        try:
+            age_range = json.loads(config.get("age_range", '[18, 65]'))  # Default to '[18, 65]' if not provided
+            age_min = age_range[0]
+            age_max = age_range[1]
+
+        except (ValueError, IndexError):
+            age_min = 18  # Default value if parsing fails
+            age_max = 65  # Default value if parsing fails
+
+
 
         if len(app_events) == 16:
             app_events += ":00"
@@ -95,76 +114,135 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
         instagram_positions = []
         messenger_positions = []
         audience_network_positions = []
-
-        if config['platforms'].get('facebook'):
-            publisher_platforms.append('facebook')
-            facebook_positions.extend([
-                'feed', 
-                'profile_feed', 
-                'marketplace', 
-                'video_feeds', 
-                'right_hand_column'
-            ])
-            if config['placements'].get('stories'):
-                facebook_positions.extend(['story', 'facebook_reels'])
-            if config['placements'].get('in_stream'):
-                facebook_positions.extend(['instream_video'])
-            if config['placements'].get('search'):
-                facebook_positions.append('search')
-        
-        if config['platforms'].get('instagram'):
-            publisher_platforms.append('instagram')
-            instagram_positions.extend(['stream', 'profile_feed', 'explore', 'explore_home'])
-            if config['placements'].get('stories'):
-                instagram_positions.extend(['story', 'reels'])
-            if config['placements'].get('search'):
-                instagram_positions.append('ig_search')
-        
-        # if config['platforms'].get('messenger'):
-        #     publisher_platforms.append('messenger')
-        #     if config['placements'].get('stories'):
-        #         messenger_positions.append('story')
-        #     if config['placements'].get('messages'):
-        #         messenger_positions.extend(['messenger_home', 'sponsored_messages'])
-
-        if config['platforms'].get('audience_network'):
-            publisher_platforms.append('audience_network')
-            audience_network_positions.extend(['classic', 'rewarded_video'])
-            # Add Facebook and Facebook feeds when Audience Network is selected
-            publisher_platforms.append('facebook')
-            facebook_positions.extend([
-                'feed', 
-                'profile_feed', 
-                'marketplace', 
-                'video_feeds', 
-                'right_hand_column'
-            ])
-
-        ad_set_params = {
-            "name": folder_name,
-            "campaign_id": campaign_id,
-            "billing_event": "IMPRESSIONS",
-            "optimization_goal": config.get("optimization_goal", "OFFSITE_CONVERSIONS"),  # Use the optimization goal from config
-            "targeting": {
-                "geo_locations": {"countries": [config["location"]]},
-                "age_min": int(config["age_range_min"]),
-                "age_max": int(config["age_range_max"]),
-                "genders": gender_value,
-                "publisher_platforms": publisher_platforms,
-                "facebook_positions": facebook_positions if facebook_positions else None,
-                "instagram_positions": instagram_positions if instagram_positions else None,
-                "messenger_positions": messenger_positions if messenger_positions else None,
-                "audience_network_positions": audience_network_positions if audience_network_positions else None
-            },
-            "start_time": start_time.strftime('%Y-%m-%dT%H:%M:%S'),
-            "dynamic_ad_image_enhancement": False,
-            "dynamic_ad_voice_enhancement": False,
-            "promoted_object": {
-                "pixel_id": config["pixel_id"],
-                "custom_event_type": config.get("event_type", "PURCHASE"),  # Use event type from config with default "PURCHASE"
-                "object_store_url": config["object_store_url"] if config["objective"] == "OUTCOME_APP_PROMOTION" else None
+        # Check for Advantage+ Targeting
+        if config.get('targeting_type') == 'Advantage':
+            # Use Advantage+ targeting settings here
+            ad_set_params = {
+                "name": folder_name,
+                "campaign_id": campaign_id,
+                "billing_event": "IMPRESSIONS",
+                "optimization_goal": config.get("optimization_goal", "OFFSITE_CONVERSIONS"),
+                "targeting_optimization_type": "TARGETING_OPTIMIZATION_ADVANTAGE_PLUS",
+                # Add any other fields required for Advantage+ targeting
+                "targeting": {
+                    "geo_locations": {"countries": [config["location"]]},
+                },
+                "start_time": start_time.strftime('%Y-%m-%dT%H:%M:%S'),
+                "dynamic_ad_image_enhancement": True,  # Example: enabling dynamic enhancements
+                "dynamic_ad_voice_enhancement": True,  # Example: enabling dynamic enhancements
+                "promoted_object": {
+                    "pixel_id": config["pixel_id"],
+                    "custom_event_type": config.get("event_type", "PURCHASE"),
+                    "object_store_url": config["object_store_url"] if config["objective"] == "OUTCOME_APP_PROMOTION" else None
+                },
+                # You may need to adjust or add additional parameters here to match Advantage+ targeting requirements
             }
-        }
+        else:
+
+            # Check platform selections and corresponding placements
+            if config['platforms'].get('facebook'):
+                publisher_platforms.append('facebook')
+                facebook_positions.extend([
+                    'feed'
+                ])
+                # Add Facebook placements if selected
+                if config['placements'].get('profile_feed'):
+                    facebook_positions.append('profile_feed')
+                if config['placements'].get('marketplace'):
+                    facebook_positions.append('marketplace')
+                if config['placements'].get('video_feeds'):
+                    facebook_positions.append('video_feeds')
+                if config['placements'].get('right_column'):
+                    facebook_positions.append('right_hand_column')
+                if config['placements'].get('stories'):
+                    facebook_positions.append('story')
+                if config['placements'].get('reels'):
+                    facebook_positions.append('facebook_reels')
+                if config['placements'].get('in_stream'):
+                    facebook_positions.append('instream_video')
+                if config['placements'].get('search'):
+                    facebook_positions.append('search')
+                if config['placements'].get('facebook_reels'):
+                    facebook_positions.append('facebook_reels')
+
+            if config['platforms'].get('instagram'):
+                publisher_platforms.append('instagram')
+                instagram_positions.extend(['stream'])
+
+                # Add Instagram placements if selected
+                if config['placements'].get('instagram_feeds'):
+                    instagram_positions.append('stream')
+                if config['placements'].get('instagram_profile_feed'):
+                    instagram_positions.append('profile_feed')
+                if config['placements'].get('explore'):
+                    instagram_positions.append('explore')
+                if config['placements'].get('explore_home'):
+                    instagram_positions.append('explore_home')
+                if config['placements'].get('instagram_stories'):
+                    instagram_positions.append('story')
+                if config['placements'].get('instagram_reels'):
+                    instagram_positions.append('reels')
+                if config['placements'].get('instagram_search'):
+                    instagram_positions.append('ig_search')
+
+            if config['platforms'].get('audience_network'):
+                publisher_platforms.append('audience_network')
+                # Add Audience Network placements if selected
+                if config['placements'].get('native_banner_interstitial'):
+                    audience_network_positions.append('classic')
+                if config['placements'].get('rewarded_videos'):
+                    audience_network_positions.append('rewarded_video')
+                # When Audience Network is selected, also add Facebook and its feeds
+                if 'facebook' not in publisher_platforms:
+                    publisher_platforms.append('facebook')
+                facebook_positions.extend([
+                    'feed',
+                ])
+
+            # if config['platforms'].get('messenger'):
+            #     publisher_platforms.append('messenger')
+            #     # Add Messenger placements if selected
+            #     if config['placements'].get('messenger_inbox'):
+            #         messenger_positions.append('messenger_home')
+            #     if config['placements'].get('messenger_stories'):
+            #         messenger_positions.append('story')
+            #     if config['placements'].get('messenger_sponsored'):
+            #         messenger_positions.append('sponsored_messages')
+
+            ad_set_params = {
+                "name": folder_name,
+                "campaign_id": campaign_id,
+                "billing_event": "IMPRESSIONS",
+                "optimization_goal": config.get("optimization_goal", "OFFSITE_CONVERSIONS"),  # Use the optimization goal from config
+                "targeting": {
+                    "geo_locations": {"countries": config["location"]},  # Updated to support multiple countries
+                    "age_min": age_min,
+                    "age_max": age_max,
+                    "genders": gender_value,
+                    "publisher_platforms": publisher_platforms,
+                    "facebook_positions": facebook_positions if facebook_positions else None,
+                    "instagram_positions": instagram_positions if instagram_positions else None,
+                    "messenger_positions": messenger_positions if messenger_positions else None,
+                    "audience_network_positions": audience_network_positions if audience_network_positions else None,
+                    "custom_audiences":config["custom_audiences"],
+                    "flexible_spec": [{"interests": [{"id": spec["value"], "name": spec.get("label", "Unknown Interest")}]} for spec in config.get("flexible_spec", [])],  # Use flexible_spec if present
+
+                },
+                "attribution_spec": [
+                {
+                    "event_type": 'CLICK_THROUGH',  # Use dynamic event type
+                    "window_days": int(attribution_setting.split('_')[0].replace('d', ''))
+                }
+                ],
+                "start_time": start_time.strftime('%Y-%m-%dT%H:%M:%S'),
+                "dynamic_ad_image_enhancement": False,
+                "dynamic_ad_voice_enhancement": False,
+                "promoted_object": {
+                    "pixel_id": config["pixel_id"],
+                    "custom_event_type": event_type,  # Use event type from config with default "PURCHASE"
+                    "object_store_url": config["object_store_url"] if config["objective"] == "OUTCOME_APP_PROMOTION" else None
+                }
+            }
 
         # Filter out None values from ad_set_params
         ad_set_params = {k: v for k, v in ad_set_params.items() if v is not None}
@@ -173,7 +251,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
             ad_set_params["bid_amount"] = bid_amount_cents
 
-        if config.get('campaign_budget_optimization') == 'AD_SET_BUDGET_OPTIMIZATION':
+        if not config.get('is_cbo'):
             if config.get('buying_type') == 'RESERVED':
                 ad_set_params["bid_strategy"] = None
                 ad_set_params["rf_prediction_id"] = config.get('prediction_id')
@@ -337,6 +415,8 @@ def get_video_duration(video_file, task_id):
             print(f"Stdout: {e.output.decode()}")
             print(f"Stderr: {e.stderr.decode()}")
             raise
+
+
 
 def trim_video(input_file, output_file, duration, task_id):
     check_cancellation(task_id)
@@ -691,6 +771,30 @@ def get_all_image_files(directory):
 @app.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
     try:
+        config = {}
+
+        def parse_custom_audiences(audience_str):
+            try:
+                # Parse the JSON string into a list of dicts
+                audiences = json.loads(audience_str)
+                # Extract only the `value` (which is the `id`)
+                return [{"id": audience["value"]} for audience in audiences]
+            except json.JSONDecodeError as e:
+                print(f"Error parsing custom audiences: {e}")
+                return []  # Return an empty list if parsing fails
+        try:
+            flexible_spec = json.loads(request.form.get("interests", "[]"))
+            print(request.form.get("interests", "[]"))
+            print(f"Flexible Spec: {flexible_spec}")
+        except (TypeError, json.JSONDecodeError):
+            flexible_spec = []  # Default to an empty list if parsing fails
+            print("Failed to parse flexible_spec")
+
+                
+        custom_audiences_str = request.form.get('custom_audiences', '[]')
+        custom_audiences = parse_custom_audiences(custom_audiences_str)
+        print(custom_audiences)
+
         campaign_name = request.form.get('campaign_name')
         campaign_id = request.form.get('campaign_id')
         print("campaign id:")
@@ -716,9 +820,8 @@ def handle_create_campaign():
         buying_type = request.form.get('buying_type', 'AUCTION')
         object_store_url = request.form.get('object_store_url', '')
         bid_amount = request.form.get('bid_amount', '0.0')
-
-        print(request.form)
-
+        is_cbo = request.form.get('isCBO', 'false').lower() == 'true'
+        
         # Receive the JavaScript objects directly
         platforms = request.form.get('platforms')
         placements = request.form.get('placements')
@@ -741,28 +844,14 @@ def handle_create_campaign():
 
         logging.info(f"Platforms after processing: {platforms}")
         logging.info(f"Placements after processing: {placements}")
+        FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v20.0')
+
 
         with tasks_lock:
             upload_tasks[task_id] = True
             process_pids[task_id] = []
 
-        if campaign_id:
-            campaign_id = find_campaign_by_id(campaign_id, ad_account_id)
-            if not campaign_id:
-                print("hello")
-                logging.error(f"Campaign ID {campaign_id} not found for ad account {ad_account_id}")
-                print(campaign_id)
-                print(ad_account_id)
-                return jsonify({"error": "Campaign ID not found"}), 404
-        else:
-            print(objective)
-            print("Objective")
-            campaign_id, campaign = create_campaign(campaign_name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token)
-            if not campaign_id:
-                logging.error(f"Failed to create campaign with name {campaign_name}")
-                return jsonify({"error": "Failed to create campaign"}), 500
-
-            config = {
+        config = {
             'ad_account_id': ad_account_id,
             'facebook_page_id': facebook_page_id,
             'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
@@ -772,7 +861,7 @@ def handle_create_campaign():
             'budget_value': budget_value,
             'bid_strategy': bid_strategy,
             'location': request.form.get('location', 'GB'),
-            'age_range_min': request.form.get('age_range_min', '30'),
+            'age_range': request.form.get('age_range',),
             'age_range_max': request.form.get('age_range_max', '65'),
             'pixel_id': pixel_id,
             'objective': objective,
@@ -795,12 +884,31 @@ def handle_create_campaign():
             'buying_type': request.form.get('buying_type', 'AUCTION'),
             'platforms': platforms,
             'placements': placements,
-            'flexible_spec': request.form.get('flexible_spec', []),
-            'geo_locations': request.form.get('geo_locations'),
-            'custom_audiences': request.form.get('custom_audiences', []),
+            'flexible_spec': flexible_spec,  # Include the parsed flexible_spec
+            'geo_locations': request.form.get('location'),
             'optimization_goal': request.form.get('performance_goal', 'OFFSITE_CONVERSIONS'),
             'event_type': request.form.get('event_type', 'PURCHASE'),
+            'is_cbo': request.form.get('isCBO', 'false').lower() == 'true',
+            'custom_audiences': custom_audiences,
+            'attribution_setting': request.form.get('attribution_setting', '7d_click')
+
+
         }
+
+        if campaign_id:
+            campaign_id = find_campaign_by_id(campaign_id, ad_account_id)
+            if not campaign_id:
+                logging.error(f"Campaign ID {campaign_id} not found for ad account {ad_account_id}")
+                print(campaign_id)
+                print(ad_account_id)
+                return jsonify({"error": "Campaign ID not found"}), 404
+        else:
+            print(objective)
+            print("Objective")
+            campaign_id, campaign = create_campaign(campaign_name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token, is_cbo)
+            if not campaign_id:
+                logging.error(f"Failed to create campaign with name {campaign_name}")
+                return jsonify({"error": "Failed to create campaign"}), 500
 
         temp_dir = tempfile.mkdtemp()
         for file in upload_folder:
