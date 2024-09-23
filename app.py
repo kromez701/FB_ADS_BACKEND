@@ -8,6 +8,8 @@ import subprocess
 import signal
 from threading import Lock
 from datetime import datetime, timedelta
+from pytz import timezone
+import re
 
 # Patch eventlet to support asynchronous operations
 import eventlet
@@ -26,6 +28,7 @@ from facebook_business.adobjects.adcreative import AdCreative
 from facebook_business.adobjects.ad import Ad
 from facebook_business.adobjects.advideo import AdVideo
 from facebook_business.adobjects.adimage import AdImage
+from facebook_business.adobjects.campaign import Campaign
 
 # External libraries
 from tqdm import tqdm
@@ -34,24 +37,102 @@ from PIL import Image
 # Concurrency tools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Flask app setup
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# Global variables for tasks and locks
 upload_tasks = {}
 tasks_lock = Lock()
 process_pids = {}
 canceled_tasks = set()
 
+# Custom Exception for canceled tasks
 class TaskCanceledException(Exception):
     pass
 
-def create_campaign(name, objective, campaign_budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token, is_cbo):
-    print(is_cbo)
+# Utility function to handle error emission through socket
+def emit_error(task_id, message):
+    logging.error(f"Raw error message: {message}")  # Log the full raw message for debugging purposes
+
+    # Initialize default title and message
+    title = "Error"
+    msg = "An unknown error occurred."
+
+    # Step 1: Extract the JSON part from the raw error message using regex
+    json_match = re.search(r'Response:\s*(\{.*\})', message, re.DOTALL)
+    
+    if json_match:
+        # Step 2: Parse the extracted JSON part
+        try:
+            error_data = json.loads(json_match.group(1))
+
+            # Step 3: Extract title and message from the parsed JSON
+            title = error_data.get("error", {}).get("error_user_title", "Error")
+            print("Title\n")
+            print(title)
+            msg = error_data.get("error", {}).get("error_user_msg", "An unknown error occurred.")
+        except json.JSONDecodeError:
+            logging.error("Failed to parse the error JSON from the response.")
+    else:
+        # If JSON is not found, just use the raw message as the fallback
+        msg = message
+
+    # Step 4: Emit the error title and message to the frontend
+    socketio.emit('error', {
+        'task_id': task_id,
+        'title': title,
+        'message': msg
+    })
+
+    # Emit only the title and message to the frontend
+    socketio.emit('error', {'task_id': task_id, 'title': title, 'message': msg})
+
+# Common cancellation check
+def check_cancellation(task_id):
+    with tasks_lock:
+        if task_id in canceled_tasks:
+            canceled_tasks.remove(task_id)
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+
+#function to check campaign budget optimization.
+def get_campaign_budget_optimization(campaign_id, ad_account_id):
+    try:
+        campaign = Campaign(campaign_id).api_get(fields=[
+            Campaign.Field.name,
+            Campaign.Field.effective_status,
+            Campaign.Field.daily_budget,
+            Campaign.Field.lifetime_budget,
+            Campaign.Field.objective
+
+        ])
+        
+        is_cbo = campaign.get('daily_budget') is not None or campaign.get('lifetime_budget') is not None
+        return {
+            "name": campaign.get('name'),
+            "effective_status": campaign.get('effective_status'),
+            "daily_budget": campaign.get('daily_budget'),
+            "lifetime_budget": campaign.get('lifetime_budget'),
+            "is_campaign_budget_optimization": is_cbo,
+            "objective": campaign.get("objective", "OUTCOME_TRAFFIC"),  # Return the campaign objective
+
+        }
+    except Exception as e:
+        print(f"Error fetching campaign details: {e}")
+        return None
+
+# Function to fetch campaign budget optimization status and return a boolean value
+def is_campaign_budget_optimized(campaign_id, ad_account_id):
+    existing_campaign_budget_optimization = get_campaign_budget_optimization(campaign_id, ad_account_id)
+    return existing_campaign_budget_optimization.get('is_campaign_budget_optimization', False)
+
+# Function to create a campaign
+def create_campaign(name, objective, budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token, is_cbo):
     check_cancellation(task_id)
     try:
         FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
-        
+
         campaign_params = {
             "name": name,
             "objective": objective,
@@ -59,23 +140,35 @@ def create_campaign(name, objective, campaign_budget_optimization, budget_value,
             "buying_type": buying_type,
         }
 
+        # Handling Auction Buying type
         if buying_type == "AUCTION":
-            budget_value_cents = int(float(budget_value) * 100)  # Convert dollars to cents
-            campaign_params["daily_budget"] = budget_value_cents if campaign_budget_optimization == "DAILY_BUDGET" and is_cbo else None
-            campaign_params["lifetime_budget"] = budget_value_cents if campaign_budget_optimization == "LIFETIME_BUDGET" and is_cbo else None
-            campaign_params["bid_strategy"] = bid_strategy if is_cbo else None
-            
-        campaign = AdAccount(ad_account_id).create_campaign(
-            fields=[AdAccount.Field.id],
-            params=campaign_params,
-        )
+            budget_value_cents = int(float(budget_value) * 100)  # Convert to cents
+            if is_cbo:
+                campaign_params["daily_budget"] = budget_value_cents if budget_optimization == "DAILY_BUDGET" else None
+                campaign_params["lifetime_budget"] = budget_value_cents if budget_optimization == "LIFETIME_BUDGET" else None
+                campaign_params["bid_strategy"] = bid_strategy
 
-        print(f"Created campaign with ID: {campaign['id']}")
+        campaign = AdAccount(ad_account_id).create_campaign(fields=[AdAccount.Field.id], params=campaign_params)
+        logging.info(f"Created campaign with ID: {campaign['id']}")
         return campaign['id'], campaign
     except Exception as e:
-        print(f"Error creating campaign: {e}")
+        error_msg = f"Error creating campaign: {e}"
+        emit_error(task_id, error_msg)
         return None, None
 
+#fetch ad_account timezone:
+def get_ad_account_timezone(ad_account_id):
+    ad_account = AdAccount(ad_account_id).api_get(fields=[AdAccount.Field.timezone_name])
+    return ad_account.get('timezone_name')
+
+def convert_to_utc(local_time_str, ad_account_timezone):
+    local_tz = timezone(ad_account_timezone)
+    local_time = local_tz.localize(datetime.strptime(local_time_str, '%Y-%m-%dT%H:%M:%S'))
+    utc_time = local_time.astimezone(timezone('UTC'))
+    return utc_time.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+# Function to create an ad set
 def create_ad_set(campaign_id, folder_name, videos, config, task_id):
     check_cancellation(task_id)
     try:
@@ -83,6 +176,10 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
         gender = config.get("gender", "All")
         attribution_setting = config.get('attribution_setting', '7d_click')  # Default to '7d_click' if not provided
         event_type = config.get('event_type', 'PURCHASE')  # Default to 'PURCHASE' if not provided
+        is_cbo = config.get('is_cbo')
+        is_existing_cbo = config.get('is_existing_cbo')
+        ad_account_timezone = config.get('ad_account_timezone')
+
         try:
             age_range = json.loads(config.get("age_range", '[18, 65]'))  # Default to '[18, 65]' if not provided
             age_min = age_range[0]
@@ -96,6 +193,8 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
 
         if len(app_events) == 16:
             app_events += ":00"
+
+        app_events = convert_to_utc(app_events, ad_account_timezone)
 
         start_time = datetime.strptime(app_events, '%Y-%m-%dT%H:%M:%S') if app_events else (datetime.now() + timedelta(days=1)).replace(
             hour=4, minute=0, second=0, microsecond=0
@@ -251,7 +350,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
             bid_amount_cents = int(float(config['bid_amount']) * 100)  # Convert to cents
             ad_set_params["bid_amount"] = bid_amount_cents
 
-        if not config.get('is_cbo'):
+        if not is_cbo and not is_existing_cbo:
             if config.get('buying_type') == 'RESERVED':
                 ad_set_params["bid_strategy"] = None
                 ad_set_params["rf_prediction_id"] = config.get('prediction_id')
@@ -270,6 +369,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
                 if end_time:
                     if len(end_time) == 16:
                         end_time += ":00"
+                    end_time = convert_to_utc(end_time, ad_account_timezone)
                     end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
                     ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
         else:
@@ -278,6 +378,7 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
                 if end_time:
                     if len(end_time) == 16:
                         end_time += ":00"
+                    end_time = convert_to_utc(end_time, ad_account_timezone)
                     end_time = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S')
                     ad_set_params["end_time"] = end_time.strftime('%Y-%m-%dT%H:%M:%S')
 
@@ -289,9 +390,11 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
         print(f"Created ad set with ID: {ad_set.get_id()}")
         return ad_set
     except Exception as e:
-        print(f"Error creating ad set: {e}")
+        error_msg = f"Error creating ad set: {e}"
+        emit_error(task_id, error_msg)
         return None
 
+# Helper functions for video and image uploads
 def upload_video(video_file, task_id, config):
     check_cancellation(task_id)
     try:
@@ -301,43 +404,22 @@ def upload_video(video_file, task_id, config):
         video_id = video.get_id()
 
         # Retry logic to ensure the video is ready
-        max_retries = 10
-        retries = 0
-        while retries < max_retries:
+        for retries in range(10):
             try:
                 ready_video = AdVideo(fbid=video_id).api_get(fields=['status'])
-                
-                # Extract the relevant statuses
-                video_status = ready_video.get('status', {}).get('video_status', 'unknown')
-                processing_status = ready_video.get('status', {}).get('processing_phase', {}).get('status', 'unknown')
-                publishing_status = ready_video.get('status', {}).get('publishing_phase', {}).get('status', 'unknown')
-                uploading_status = ready_video.get('status', {}).get('uploading_phase', {}).get('status', 'unknown')
-
-                # Print the statuses on every retry
-                print(f"Retry {retries + 1}/{max_retries}")
-                print(f"Video Status: {video_status}")
-                print(f"Processing Phase Status: {processing_status}")
-                print(f"Publishing Phase Status: {publishing_status}")
-                print(f"Uploading Phase Status: {uploading_status}\n")
-
-                if video_status == 'ready':
-                    print(f"Video {video_id} is ready for use.")
-                    break
+                if ready_video.get('status', {}).get('video_status', 'unknown') == 'ready':
+                    logging.info(f"Video {video_id} is ready for use.")
+                    return video_id
             except Exception as retry_error:
-                print(f"Error during retry {retries + 1}: {retry_error}")
-                
-            # Wait 10 seconds before retrying
+                logging.error(f"Error during retry {retries + 1}: {retry_error}")
             time.sleep(10)
-            retries += 1
 
-        if retries == max_retries:
-            print(f"Video {video_id} was not ready after {max_retries} retries.")
-            return None
+        logging.error(f"Video {video_id} was not ready after 10 retries.")
+        return None
 
-        print(f"Uploaded video with ID: {video_id}")
-        return video_id
     except Exception as e:
-        print(f"Error uploading video: {e}")
+        error_msg = f"Error uploading video: {e}"
+        emit_error(task_id, error_msg)
         return None
 
 def upload_image(image_file, task_id, config):
@@ -346,43 +428,30 @@ def upload_image(image_file, task_id, config):
         image = AdImage(parent_id=config['ad_account_id'])
         image[AdImage.Field.filename] = image_file
         image.remote_create()
-        print(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
+        logging.info(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
         return image[AdImage.Field.hash]
     except Exception as e:
-        print(f"Error uploading image: {e}")
+        error_msg = f"Error uploading image: {e}"
+        emit_error(task_id, error_msg)
         return None
 
+# Function to generate thumbnails for videos
 def generate_thumbnail(video_file, thumbnail_file, task_id):
     check_cancellation(task_id)
-    command = [
-        'ffmpeg',
-        '-i', video_file,
-        '-ss', '00:00:01.000',
-        '-vframes', '1',
-        '-update', '1',  # Ensure single image output
-        thumbnail_file
-    ]
+    command = ['ffmpeg', '-i', video_file, '-ss', '00:00:01.000', '-vframes', '1', '-update', '1', thumbnail_file]
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         with tasks_lock:
-            if task_id not in process_pids:
-                process_pids[task_id] = []
-            process_pids[task_id].append(proc.pid)
+            process_pids.setdefault(task_id, []).append(proc.pid)
         stdout, stderr = proc.communicate()
-        if proc.returncode == -signal.SIGTERM:
-            print(f"Process for task {task_id} was terminated.")
-            raise TaskCanceledException(f"Task {task_id} has been canceled")
+
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+
     except subprocess.CalledProcessError as e:
-        if e.returncode == -signal.SIGTERM:
-            print(f"Process for task {task_id} was terminated by signal.")
-            raise TaskCanceledException(f"Task {task_id} has been canceled")
-        else:
-            print(f"Error generating thumbnail: {e.cmd} returned non-zero exit status {e.returncode}")
-            print(f"Stdout: {e.output.decode()}")
-            print(f"Stderr: {e.stderr.decode()}")
-            raise
+        error_msg = f"Error generating thumbnail: {e.cmd} returned non-zero exit status {e.returncode}"
+        emit_error(task_id, error_msg)
+        raise
 
 def get_video_duration(video_file, task_id):
     check_cancellation(task_id)
@@ -506,6 +575,10 @@ def create_ad(ad_set_id, media_file, config, task_id):
                         }
                     }
                 }
+
+                # Conditionally add instagram_actor_id
+                if config.get('instagram_actor_id'):
+                    object_story_spec["instagram_actor_id"] = config['instagram_actor_id']
                                 
                 degrees_of_freedom_spec = {
                     "creative_features_spec": {
@@ -609,8 +682,8 @@ def create_ad(ad_set_id, media_file, config, task_id):
         if isinstance(e, subprocess.CalledProcessError) and e.returncode == -signal.SIGTERM:
             print(f"Task {task_id} process was terminated by signal.")
         else:
-            print(f"Error creating ad: {e}")
-            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            error_msg = f"Error creating ad: {e}"
+            emit_error(task_id, error_msg)
 
 def create_carousel_ad(ad_set_id, media_files, config, task_id):
     check_cancellation(task_id)
@@ -696,6 +769,10 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
                 }
             }
 
+            # Conditionally add instagram_actor_id
+            if config.get('instagram_actor_id'):
+                object_story_spec["instagram_actor_id"] = config['instagram_actor_id']
+
             degrees_of_freedom_spec = {
                 "creative_features_spec": {
                     "standard_enhancements": {
@@ -727,8 +804,8 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
         if isinstance(e, subprocess.CalledProcessError) and e.returncode == -signal.SIGTERM:
             print(f"Task {task_id} process was terminated by signal.")
         else:
-            print(f"Error creating carousel ad: {e}")
-            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            error_msg = f"Error creating carousel ad: {e}"
+            emit_error(task_id, error_msg)
             
 def find_campaign_by_id(campaign_id, ad_account_id):
     try:
@@ -745,12 +822,6 @@ def find_campaign_by_id(campaign_id, ad_account_id):
     except Exception as e:
         print(f"Error finding campaign by ID: {e}")
         return None
-
-def check_cancellation(task_id):
-    with tasks_lock:
-        if task_id in canceled_tasks:
-            canceled_tasks.remove(task_id)
-            raise TaskCanceledException(f"Task {task_id} has been canceled")
 
 def get_all_video_files(directory):
     video_files = []
@@ -846,6 +917,8 @@ def handle_create_campaign():
         logging.info(f"Placements after processing: {placements}")
         FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v20.0')
 
+        ad_account_timezone = get_ad_account_timezone(ad_account_id)
+
 
         with tasks_lock:
             upload_tasks[task_id] = True
@@ -890,13 +963,16 @@ def handle_create_campaign():
             'event_type': request.form.get('event_type', 'PURCHASE'),
             'is_cbo': request.form.get('isCBO', 'false').lower() == 'true',
             'custom_audiences': custom_audiences,
-            'attribution_setting': request.form.get('attribution_setting', '7d_click')
-
-
+            'attribution_setting': request.form.get('attribution_setting', '7d_click'),
+            'ad_account_timezone': ad_account_timezone,
+            'instagram_actor_id': request.form.get('instagram_account', '')
         }
 
         if campaign_id:
             campaign_id = find_campaign_by_id(campaign_id, ad_account_id)
+            existing_campaign_budget_optimization = get_campaign_budget_optimization(campaign_id, ad_account_id)
+            is_existingCBO = existing_campaign_budget_optimization.get('is_campaign_budget_optimization', False)
+            config['is_existing_cbo'] = is_existingCBO
             if not campaign_id:
                 logging.error(f"Campaign ID {campaign_id} not found for ad account {ad_account_id}")
                 print(campaign_id)
@@ -1142,44 +1218,90 @@ def handle_create_campaign():
                         check_cancellation(task_id)
                         folder_path = os.path.join(temp_dir, folder)
 
-                        video_files = get_all_video_files(folder_path)
-                        image_files = get_all_image_files(folder_path)
-                        media_files = video_files + image_files
+                        # Check if the folder contains subfolders
+                        if has_subfolders(folder_path):
+                            for subfolder in os.listdir(folder_path):
+                                subfolder_path = os.path.join(folder_path, subfolder)
+                                if os.path.isdir(subfolder_path):
+                                    video_files = get_all_video_files(subfolder_path)
+                                    image_files = get_all_image_files(subfolder_path)
+                                    media_files = video_files + image_files
 
-                        if media_files:
-                            ad_set = create_ad_set(campaign_id, folder, media_files, config, task_id)
-                            if not ad_set:
-                                continue
+                                    if media_files:
+                                        # Create an ad set for each subfolder
+                                        ad_set = create_ad_set(campaign_id, subfolder, media_files, config, task_id)
+                                        if not ad_set:
+                                            continue
 
-                            if config['ad_format'] == 'Single image or video':
-                                with ThreadPoolExecutor(max_workers=5) as executor:
-                                    future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
+                                        if config['ad_format'] == 'Single image or video':
+                                            with ThreadPoolExecutor(max_workers=5) as executor:
+                                                future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
 
-                                    for future in as_completed(future_to_media):
-                                        check_cancellation(task_id)
-                                        media = future_to_media[future]
-                                        try:
-                                            future.result()
-                                        except TaskCanceledException:
-                                            logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
-                                            return
-                                        except Exception as e:
-                                            logging.error(f"Error processing media {media}: {e}")
-                                            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
-                                        finally:
-                                            processed_files += 1
-                                            pbar.update(1)
+                                                for future in as_completed(future_to_media):
+                                                    check_cancellation(task_id)
+                                                    media = future_to_media[future]
+                                                    try:
+                                                        future.result()
+                                                    except TaskCanceledException:
+                                                        logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
+                                                        return
+                                                    except Exception as e:
+                                                        logging.error(f"Error processing media {media}: {e}")
+                                                        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                                    finally:
+                                                        processed_files += 1
+                                                        pbar.update(1)
 
-                                            current_time = time.time()
-                                            if current_time - last_update_time >= 0.5:
-                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
-                                                last_update_time = current_time
+                                                        current_time = time.time()
+                                                        if current_time - last_update_time >= 0.5:
+                                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
+                                                            last_update_time = current_time
 
-                            elif config['ad_format'] == 'Carousel':
-                                create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
+                                        elif config['ad_format'] == 'Carousel':
+                                            create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
+
+                        else:
+                            # Process the folder if no subfolders exist
+                            video_files = get_all_video_files(folder_path)
+                            image_files = get_all_image_files(folder_path)
+                            media_files = video_files + image_files
+
+                            if media_files:
+                                # Create an ad set for the folder
+                                ad_set = create_ad_set(campaign_id, folder, media_files, config, task_id)
+                                if not ad_set:
+                                    continue
+
+                                if config['ad_format'] == 'Single image or video':
+                                    with ThreadPoolExecutor(max_workers=5) as executor:
+                                        future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
+
+                                        for future in as_completed(future_to_media):
+                                            check_cancellation(task_id)
+                                            media = future_to_media[future]
+                                            try:
+                                                future.result()
+                                            except TaskCanceledException:
+                                                logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
+                                                return
+                                            except Exception as e:
+                                                logging.error(f"Error processing media {media}: {e}")
+                                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                            finally:
+                                                processed_files += 1
+                                                pbar.update(1)
+
+                                                current_time = time.time()
+                                                if current_time - last_update_time >= 0.5:
+                                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
+                                                    last_update_time = current_time
+
+                                elif config['ad_format'] == 'Carousel':
+                                    create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
 
                 socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_files}/{total_files}"})
                 socketio.emit('task_complete', {'task_id': task_id})
+
             except TaskCanceledException:
                 logging.warning(f"Task {task_id} has been canceled during mixed media processing.")
             except Exception as e:
@@ -1228,6 +1350,31 @@ def cancel_task():
     except Exception as e:
         print(f"Error handling cancel task request: {e}")
         return jsonify({"error": "Internal server error"}), 500
+    
+@app.route('/get_campaign_budget_optimization', methods=['POST'])
+def handle_get_campaign_budget_optimization():
+    try:
+        data = request.json        
+        campaign_id = data.get('campaign_id')
+        ad_account_id = data.get('ad_account_id')
+        app_id = data.get('app_id')
+        app_secret = data.get('app_secret')
+        access_token = data.get('access_token')
 
+        if not campaign_id or not ad_account_id or not app_id or not app_secret or not access_token:
+            return jsonify({"error": "Campaign ID, Ad Account ID, App ID, App Secret, and Access Token are required"}), 400
+
+        FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
+        campaign_budget_optimization = is_campaign_budget_optimized(campaign_id, ad_account_id)
+
+        if campaign_budget_optimization is not None:
+            return jsonify({"campaign_budget_optimization": campaign_budget_optimization}), 200
+        else:
+            return jsonify({"error": "Failed to retrieve campaign budget optimization details"}), 500
+
+    except Exception as e:
+        logging.error(f"Error in handle_get_campaign_budget_optimization: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    
 if __name__ == "__main__":
     socketio.run(app, debug=True, host='0.0.0.0',port=5001)
