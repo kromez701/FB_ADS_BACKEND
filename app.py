@@ -650,6 +650,11 @@ def create_ad(ad_set_id, media_file, config, task_id):
                     }
                 }
 
+                # Conditionally add instagram_actor_id
+                if config.get('instagram_actor_id'):
+                    object_story_spec["instagram_actor_id"] = config['instagram_actor_id']
+                    print("Instagram Actor ID:", config.get('instagram_actor_id'))
+                                
                 degrees_of_freedom_spec = {
                     "creative_features_spec": {
                         "standard_enhancements": {
